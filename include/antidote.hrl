@@ -17,6 +17,9 @@
 -define(OLD_SS_MICROSEC,0).
 -define(NUM_SUP, 20).
 -define(SPIN_WAIT, 10).
+
+-define(USE_HONEYPOT, true).
+
 -record (payload, {key:: key(), type :: type(), op_param, actor}).
 
 %% Used by the replication layer

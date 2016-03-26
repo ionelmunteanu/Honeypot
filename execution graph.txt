@@ -1,0 +1,46 @@
+antidote:clocksi_execute_tx([{read, {m, riak_dt_gcounter}}])
+
+	(clocksi_static_tx_coord_fsm.erl)
+
+	{ok, CoordFsmPid} = clocksi_static_tx_coord_sup:start_fsm([self(), Operations]), (creates clocksi_static_tx_coord_fsm with params at init and get pid)
+    gen_fsm:sync_send_event(CoordFsmPid, execute) (send execute message to newly reated actor)
+
+    	(clocksi_static_tx_coord_fsm.erl)
+    	%%The list of operations received from init argument are passed to a functor which calls 
+
+	    {update, {Key, Type, OpParams}} -> case clocksi_interactive_tx_coord_fsm:perform_update({Key,Type,OpParams},Acc#tx_coord_state.updated_partitions,Transaction,undefined) of %% in the case of an update
+	    	(clocksi_interactive_tx_coord_fsm:perform_update)
+
+	    	%% get preference list of where the log might be. thi triggers a call to the riak corre ring manager
+	    	%% which hasehs the key first and retrieves the list of buckets
+	    	Preflist = ?LOG_UTIL:get_preflist_from_key(Key)
+	    	clocksi_downstream:generate_downstream_op(Transaction, IndexNode, Key, Type, Param, WriteSet)
+	    		clocksi_vnode:read_data_item
+
+	    	?LOGGING_VNODE:append(Node,LogId,LogRecord)
+	    		riak_core_vnode_master:sync_command(IndexNode,{append, LogId, Payload, false},?LOGGING_MASTER, infinity).
+
+
+	    {read, {Key, Type}} ->	case clocksi_interactive_tx_coord_fsm:perform_read({Key,Type},Acc#tx_coord_state.updated_partitions,transaction,undefined) of %% in the case of a read
+	    	(clocksi_interactive_tx_coord_fsm)
+	    	%%calculates the list of nodes where the key might be persisted and gets the first occurence
+	    	%%calls 
+	    	?CLOCKSI_VNODE:read_data_item(IndexNode, Transaction, Key, Type, WriteSet) %%to check th vnode for a snapshot 
+	    		(clocksi_vnode)
+	    		in read_data_item(Node, TxId, Key, Type, Updates) calls
+	    			clocksi_readitem_fsm:read_data_item(Node,Key,Type,TxId)
+	    				 Type:generate_downstream(Op, Actor, Snapshot) 
+
+
+		%% after which calling
+		clocksi_interactive_tx_coord_fsm:prepare(NewState#tx_coord_state{from=Sender})
+			(clocksi_interactive_tx_coord_fsm)
+
+
+!!!!The key is clocksi_vnode:read_data_item
+	clocksi_vnode:read_data_item
+		clocksi_materializer:materialize_eager(Type, Snapshot, Updates2)
+			materializer:materialize_eager(Type, Snapshot, Ops)
+
+
+let's check how the data is sent back 

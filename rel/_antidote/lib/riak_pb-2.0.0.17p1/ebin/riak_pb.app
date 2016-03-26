@@ -1,0 +1,10 @@
+{application,riak_pb,
+             [{description,"Riak Protocol Buffers Messages"},
+              {vsn,"2.0.0.17p1"},
+              {registered,[]},
+              {applications,[kernel,stdlib,protobuffs]},
+              {env,[]},
+              {modules,[antidote_pb,riak_dt_pb,riak_kv_pb,riak_pb,
+                        riak_pb_codec,riak_pb_dt_codec,riak_pb_kv_codec,
+                        riak_pb_messages,riak_pb_search_codec,riak_search_pb,
+                        riak_yokozuna_pb]}]}.

@@ -44,6 +44,7 @@
 -define(CLOCKSI_DOWNSTREAM, clocksi_downstream).
 -endif.
 
+-define(HONEYPOT, true).
 
 %% API
 -export([start_link/3, start_link/2]).
@@ -148,7 +149,14 @@ execute_batch_ops(timeout,
                                                     error ->
                                                         Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
                                                         IndexNode = hd(Preflist),
-                                                        ?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId);
+                                                        case ?HONEYPOT of
+                                                            true -> 
+                                                                io:format("using honeypot~n"),
+                                                                cache_serv:read(IndexNode, Key, Type, TxId);
+                                                            _ -> 
+                                                                io:format("bypassing honeypot~n"),
+                                                                ?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId)
+                                                        end;
                                                     {ok, SnapshotState} ->
                                                         {ok, {Type,SnapshotState}}
                                                     end,

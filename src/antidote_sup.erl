@@ -113,6 +113,16 @@ init(_Args) ->
     %		      permanent, 5000, supervisor,
     %		      [inter_dc_communication_sender_fsm_sup]},
 
+    CacheServSup = {cache_serv_sup,
+              {cache_serv_sup, start_link, []},
+              permanent, 5000, supervisor, 
+              [cache_serv_sup]},
+
+    TimerServSup = {cache_timer_serv_sup,
+              {cache_timer_serv_sup, start_link, []},
+              permanent, 5000, supervisor,
+              [cache_timer_serv_sup]},
+
     antidote_config:load("antidote.config"),
 
 
@@ -132,6 +142,8 @@ init(_Args) ->
        %InterDcRepMaster,
        %InterDcRecvrMaster,
        %InterDcManager,
+       CacheServSup, 
+       TimerServSup,
        VectorClockMaster]}}.
        %InterDcSenderSup,
        %MaterializerMaster]}}.
