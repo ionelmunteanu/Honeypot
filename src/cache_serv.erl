@@ -6,7 +6,7 @@
 -define(BKUP_FILE, "cache_restore_file").
 -define(MAX_TABLE_SIZE, 10000).
 -define(MAX_INT, 65535).
--define(LEASE, 20000).
+-define(LEASE, 5000).
 %%  Eviction strategy based on: 
 %%    - hit_count - least number of demands
 %%    - last_accessed - oldest to be accessed
@@ -60,7 +60,6 @@
 %% =============================================================================
 
 start_link() ->
-  io:format("starting cache serv ~n"),
   gen_server:start_link({global, ?MODULE}, ?MODULE, [],[]).
 
 stop() ->
@@ -90,16 +89,14 @@ read({Partition, Node}, Key, Type, TxId) ->
 %% Returns: - 
 
 update([{{Partition, Node}, WriteSet}], TxId,OriginalSender) ->
-  io:format("update api~n"),
   Answer = gen_server:call({global,gen_cache_name()}, {update, [{{Partition, Node}, WriteSet}], TxId, OriginalSender}),
   io:format("returtning from update gen_serv call: ~p, ~n", [Answer]),
   Answer.
 
 
 
-update_multi([{{Partition, Node}, WriteSet}|_Rest], TxId, OriginalSender) ->
-    gen_server:call({global,gen_cache_name()}, 
-                  {update_multi, [{{Partition, Node}, WriteSet}|_Rest], TxId, OriginalSender}).
+update_multi([{{Partition, Node}, WriteSet}|Rest], TxId, OriginalSender) ->
+    gen_server:call({global,gen_cache_name()}, {update_multi, [{{Partition, Node}, WriteSet}|Rest], TxId, OriginalSender}).
 
 cache_info(Item) ->
   ets:info(?CACHE, Item).   
@@ -147,19 +144,16 @@ handle_call({simple_lookup, Key, _Type, _TxId}, _From, State=#state{table_name=T
 %% 
 
 handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit}) ->
-  %%Reply = case get_crdt(Table, {Node, Key, Type, TxId}, SizeLimit) of
-  io:format("READ CALLBACK~n"),
-   
+  
   Reply = case fetch_cachable_crdt({Partition, Node},Key, Type,TxId, Table) of
     {error, Reason} ->
       io:format("Error has occured while fetching crdt from Vnode.~nReason: ~w~n", [Reason]),
       {error, Reason};
     {ok,Object} ->
       ets:insert(Table, Object),
-      io:format("found: ~p  ~n", [Object]),
+      trigger_counter(Object), %% will trigger counter if object has just been cached(i.e. hit count is -1)
       {ok,{Type, Object#crdt.snapshot}}
   end,
-  io:format("Replying with ~p ~n", [Reply]),
   {reply, Reply, State};
 
 
@@ -168,28 +162,16 @@ handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{ta
 %% WriteSet = [{Key, Type, {Operation, Actor}}]
 %% TO DO : case of abort! 
 handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, prepared = Prepared}) ->
-  
-  io:format("UPDATE CALLBACK~n"),
-
-  _HitCount = lists:foldl(fun( {K, _Type, {_Op, _Actor}}, Acc) -> 
-                            case ets:lookup(Table,K) of 
-                              [] -> Acc ;
-                               _-> Acc +1 
-                            end 
-                        end, 0, WriteSet),
 
   UpdateVal = fun(FObject, FType, FOp, FActor) ->  
-                    {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
-                    Result
-                  end,
-
+                {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
+                Result
+              end,
 
   UpdateItemFun = fun(UpdateOp, Acc) ->
     {Key, Type, {Op, Actor}} = UpdateOp,
-    
     ets:insert(Prepared, {Key}),
-
-      %%hit count is updated automatically by fetch_catchable_crdt (might break separation of concerns )
+    %%hit count is updated automatically by fetch_catchable_crdt (might break separation of concerns )
     case fetch_cachable_crdt({Partition, Node},Key, Type,TxId, Table) of
       {error, Reason} ->
         io:format("Error has occured while fetching crdt from Vnode.~nReason: ~w~n", [Reason]),
@@ -199,9 +181,13 @@ handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _F
         UpdatedObject = Object#crdt{snapshot = UpdateVal(Object, Type, Op, Actor),ops= (Object#crdt.ops ++ [{Op, Actor}])},
         
         ets:insert(Table, UpdatedObject),
-        case lists:member(Key, Acc) of
-          false -> lists:append(Acc, [Key]);
-          true -> Acc
+        %% triggerring will be done only newly inserted key (i.e. hit_count = 0 )and only one
+        %% one key will trigger a chain reaction. 
+        %%trigger_counter(Object),
+        %%case lists:member(Key, Acc) of
+        case Object#crdt.hit_count =:= 0 of
+          true -> lists:append(Acc, [Object]);
+          false -> Acc
         end
        
       end %fetch_cachable_crdt
@@ -209,24 +195,30 @@ handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _F
     end, %UpdateItemFun
 
   UpdatedKeySet = lists:foldl(UpdateItemFun,[],WriteSet),
-  io:format("updated:~p, ~n ", [UpdatedKeySet]),
-  %FinishTime = time_now(),
-  %riak_core_vnode:reply(OriginalSender, {committed, FinishTime}),
+  io:format("newly inserted:~p, ~n ", [UpdatedKeySet]),
+  case UpdatedKeySet of
+    [Head| _DontCare] ->
+      trigger_counter(Head);
+    _ ->
+      no_need_to_trigger
+  end, 
   {reply, ok, State};
 
 
-
+% [
+%   {{0,'antidote@127.0.0.1'}, [{c,riak_dt_gcounter,{increment,c}}, {a,riak_dt_gcounter,{increment,}}]},            
+%   {{730750818665451459101842416358141509827966271488,'antidote@127.0.0.1'},[{m,riak_dt_gcounter,{increment,1}}]}
+% ]
 
 handle_call({update_multi, WriteSetList, TxId,OriginalSender}, _From, 
             State=#state{table_name = Table, max_table_size = SizeLimit, 
             prepared = Prepared, node= Node}) ->
   Ppfun = fun(A, B) -> pp(A,B) end, 
 
-  {_,KeyMulte, HitMulte,_,_,_}= lists:foldl(Ppfun, {TxId, [], 0, Table, Prepared ,SizeLimit},  WriteSetList),
+  {_,KeyMulte, HitMulte,_,_,_} = lists:foldl(Ppfun, {TxId, [], 0, Table, Prepared ,SizeLimit},  WriteSetList),
 
   cache_timer_serv:start_counter(Node, KeyMulte, ?LEASE, HitMulte, self()),
   lists:map(fun(_X) ->  riak_core_vnode:reply(OriginalSender, {prepared, time_now()}) end, WriteSetList),
-  %%lists:map(fun(_X) ->  riak_core_vnode:reply(OriginalSender, {committed, time_now()}) end, WriteSetList),
   {reply, ok, State}.
 
 
@@ -275,7 +267,6 @@ handle_cast(Msg, State) ->
 %% =============================================================================
 
 handle_info({lease_expired, Keys}, State=#state{table_name = Table}) ->
-  io:format(" ~w has expired: ~n", [Keys]),
   Evict = fun(Key) ->
     case ets:lookup(Table, Key) of
       [] ->
@@ -317,17 +308,10 @@ code_change(_OldVsn, State, _Extra) ->
 %% params to send to vnode is this: 
 %% [{{Partition,Node}, [{Key,Type,{Op,Actor/Amount}}]}]
 return_to_owner(Object) ->
-  io:format("returning |~p|  ~n", [Object]),  
+  io:format("returning: ~p  ~n", [Object]),  
   {Key, Type, [{Op, Actor}|_], TxId} = {Object#crdt.key, Object#crdt.type, Object#crdt.ops, Object#crdt.txId},
   Node = hd(log_utilities:get_preflist_from_key(Key)),
-  io:format("returning to owner:~p ~n", [[{
-                                  Node, 
-                                  [{Key,Type, {Op, Actor}}] 
-                                }]]),
-  clocksi_vnode:single_commit([{
-                                  Node, 
-                                  [{Key,Type, {Op, Actor}}] 
-                                }], TxId).
+  clocksi_vnode:single_commit([{Node, [{Key,Type, {Op, Actor}}] }], TxId).
 
 
 %% Evicts cache CRDTs using defined strategy until ExtraSizeAmount 
@@ -396,7 +380,8 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
           Object = #crdt{ key =  Key, snapshot = CrdtSnapshot, hit_count  =  0, last_accessed = 0,
                           time_created  = 0, type = Type, stable_version = -1, borrow_time = -1, ops = [], txId = TxId}, 
           %% start counter only if element has was not previously cached.
-          cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
+          %% not a good ideea since it might trigger a counter for a key linked to a previous cachef one by a transaction id
+          %cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
           {ok, Object};
         {error, Reason} -> 
           {error, Reason}
@@ -404,10 +389,22 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
 
       %%object found in cache. update last_accessdd and increse hit_count
       [Object] ->
-        UpdatedObject = Object#crdt{ hit_count = Object#crdt.hit_count+1, last_accessed = time_now()},
+        UpdatedObject = Object#crdt{hit_count = Object#crdt.hit_count+1, last_accessed = time_now()},
         {ok, UpdatedObject}
    end.
 
+
+%%Caled in case of a read or single update. If object has just been cached, its hitcount is -1. This means a counter has never been trigger for this key
+%%
+
+trigger_counter(Object) ->
+  case Object#crdt.hit_count =:= 0 of
+    true -> 
+      cache_timer_serv:start_counter( hd(log_utilities:get_preflist_from_key(Object#crdt.key)),
+                                        Object#crdt.txId, [Object#crdt.key], ?LEASE, -1, self());
+    _ ->
+      ok
+  end.
 
 % %% TO DO: test this function
 % evict(Table) ->
