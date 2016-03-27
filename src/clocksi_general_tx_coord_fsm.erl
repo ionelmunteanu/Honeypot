@@ -212,7 +212,7 @@ execute_batch_ops(timeout,
         _N->
 
             io:format("using honeypot with params `:~p~n2:~p~n",[dict:to_list(WriteSet1),TxId]),
-            Res = cache_serv:update_multi(dict:to_list(WriteSet1),TxId, self()),
+            Res = cache_serv:update(dict:to_list(WriteSet1),TxId, self()),
             io:format("update command has returned with : ~p, ~n", [Res]),
             reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, commit_time=clocksi_vnode:now_microsec(now())})
             % ?CLOCKSI_VNODE:prepare(WriteSet1, TxId),
