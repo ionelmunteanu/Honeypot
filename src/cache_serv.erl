@@ -8,10 +8,10 @@
 -define(MAX_INT, 65535).
 -define(LEASE, 20000).
 %%  Eviction strategy based on: 
-%%    - cache_hits - least number of demands
+%%    - hit_count - least number of demands
 %%    - last_accessed - oldest to be accessed
 %%    - time_created  - oldest item -> cache will soon expire
--define(EVICT_STRAT_FIELD, cache_hits).
+-define(EVICT_STRAT_FIELD, hit_count).
 
 -record (state,{table_name :: term(),
         tmr_serv_id :: term(),
@@ -24,7 +24,7 @@
 -record (crdt, {
         key :: term(),
         snapshot :: term()|[term()],
-        cache_hits :: integer(),
+        hit_count :: integer(),
         last_accessed :: term(),
         time_created :: term(),
         type :: type(),
@@ -78,14 +78,8 @@ stop() ->
 %%  {ok, {Type, Value}}
 
 read({Partition, Node}, Key, Type, TxId) ->
-  io:format("read api~n"), 
-  Something = gen_server:call({global,gen_cache_name()}, {read, {{Partition, Node}, Key, Type, TxId}}),
-  io:format("wtf??  ~p  ~n ", [Something]),
-  Something.
+  gen_server:call({global, cache_serv}, {read, {{Partition, Node}, Key, Type, TxId}}).
 
-% store(Node, Key, Type, SeqNr) ->
-%   io:format("Caching node ~n"),
-%   gen_server:call().
 
 %% Calls a callback responsable with updating items in the cache, similar to 
 %% a ClockSI tx coordinator's "sigle_commit" function.
@@ -97,7 +91,11 @@ read({Partition, Node}, Key, Type, TxId) ->
 
 update([{{Partition, Node}, WriteSet}], TxId,OriginalSender) ->
   io:format("update api~n"),
-  gen_server:call({global,gen_cache_name()}, {update, [{{Partition, Node}, WriteSet}], TxId, OriginalSender}).
+  Answer = gen_server:call({global,gen_cache_name()}, {update, [{{Partition, Node}, WriteSet}], TxId, OriginalSender}),
+  io:format("returtning from update gen_serv call: ~p, ~n", [Answer]),
+  Answer.
+
+
 
 update_multi([{{Partition, Node}, WriteSet}|_Rest], TxId, OriginalSender) ->
     gen_server:call({global,gen_cache_name()}, 
@@ -137,42 +135,31 @@ handle_call({simple_lookup, Key, _Type, _TxId}, _From, State=#state{table_name=T
       {none};
     [Object] ->
       UpdatedObject = Object#crdt{last_accessed = time_now(),
-                                  cache_hits = Object#crdt.cache_hits + 1},
+                                  hit_count = Object#crdt.hit_count + 1},
       ets:insert(Table, UpdatedObject),
       {ok, Object#crdt.snapshot}
     end,
   {reply, Reply, State};
 
+
 %% The list argument is of form [{{Partition,Node}, WriteSet}]
 %% and                          WriteSet = {Key, Type, {Op, Actor}}
 %% 
+
 handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit}) ->
   %%Reply = case get_crdt(Table, {Node, Key, Type, TxId}, SizeLimit) of
   io:format("READ CALLBACK~n"),
-  Reply = case ets:lookup(Table, Key) of 
-
-    [] ->
-      case fetch_cachable_crdt({Partition, Node},Key, Type,TxId) of 
-        {ok, FetchedObj} ->
-
-          cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
-          ets:insert(Table, FetchedObj),
-          io:format("fetched: ~p  ~n", [FetchedObj]),
-          {ok, {Type, FetchedObj#crdt.snapshot}};
-          %{ok, FetchedObj};
-        {error, Reason} ->
-          io:format("got error:!!!:!:!:!~p~n ", [Reason]),
-          {error, Reason}
-      end;
-
-    [Object] ->
-      UpdatedObject = Object#crdt{last_accessed = time_now(),cache_hits = Object#crdt.cache_hits + 1},
-      ets:insert(Table, UpdatedObject),
-      io:format("found: ~p  ~n", [UpdatedObject]),
+   
+  Reply = case fetch_cachable_crdt({Partition, Node},Key, Type,TxId, Table) of
+    {error, Reason} ->
+      io:format("Error has occured while fetching crdt from Vnode.~nReason: ~w~n", [Reason]),
+      {error, Reason};
+    {ok,Object} ->
+      ets:insert(Table, Object),
+      io:format("found: ~p  ~n", [Object]),
       {ok,{Type, Object#crdt.snapshot}}
-      %{ok, Object}
-    end,
-  io:format("replying with ~p ~n", [Reply]),
+  end,
+  io:format("Replying with ~p ~n", [Reply]),
   {reply, Reply, State};
 
 
@@ -180,62 +167,50 @@ handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{ta
 %%{[{Partition,Node}, WriteSet], TxId}
 %% WriteSet = [{Key, Type, {Operation, Actor}}]
 %% TO DO : case of abort! 
-handle_call({update, [{Node, WriteSet}], TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, prepared = Prepared}) ->
+handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, prepared = Prepared}) ->
   
   io:format("UPDATE CALLBACK~n"),
 
-  HitCount = lists:foldl(fun( {K, _Type, {_Op, _Actor}}, Acc) -> 
+  _HitCount = lists:foldl(fun( {K, _Type, {_Op, _Actor}}, Acc) -> 
                             case ets:lookup(Table,K) of 
                               [] -> Acc ;
                                _-> Acc +1 
                             end 
                         end, 0, WriteSet),
 
-  GtSnpShotVal = fun(FObject, FType, FOp, FActor) ->  
+  UpdateVal = fun(FObject, FType, FOp, FActor) ->  
                     {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
                     Result
                   end,
 
 
-  UpdateItemFun = fun(REcv, Acc) ->
-    {Key, Type, {Op, Actor}} = REcv,
+  UpdateItemFun = fun(UpdateOp, Acc) ->
+    {Key, Type, {Op, Actor}} = UpdateOp,
+    
     ets:insert(Prepared, {Key}),
 
-    case ets:lookup(Table, Key) of
-      [] ->
-        io:format("GETTING THE OBJECT AND CACHING IT~n"),
-        io:format("~w  ~n", [{Node, Key, Type, TxId}] ),
-        CachedObject = gen_server:call(self(), {read, {Node, Key, Type, TxId}}),
-        io:format("OBJECT CACHED~n"),
-        CachedObject;
+      %%hit count is updated automatically by fetch_catchable_crdt (might break separation of concerns )
+    case fetch_cachable_crdt({Partition, Node},Key, Type,TxId, Table) of
+      {error, Reason} ->
+        io:format("Error has occured while fetching crdt from Vnode.~nReason: ~w~n", [Reason]),
+        {error, Reason};
 
       {ok, Object} ->
-        io:format("oBJECT ALREADY CACHED. UPDATING IT~n"),
-        UpdatedObject = Object#crdt{ 
-                          last_accessed = time_now(),
-                          snapshot = GtSnpShotVal(Object, Type, Op, Actor),
-                          ops= (Object#crdt.ops ++ [{Op, Actor}])
-                        },
+        UpdatedObject = Object#crdt{snapshot = UpdateVal(Object, Type, Op, Actor),ops= (Object#crdt.ops ++ [{Op, Actor}])},
         
         ets:insert(Table, UpdatedObject),
         case lists:member(Key, Acc) of
           false -> lists:append(Acc, [Key]);
           true -> Acc
-        end;
+        end
+       
+      end %fetch_cachable_crdt
+      
+    end, %UpdateItemFun
 
-      {error, Reason} ->
-        {error, Reason}
-      end
-    end,
-
-  T = time_now(), 
   UpdatedKeySet = lists:foldl(UpdateItemFun,[],WriteSet),
-  TDelta = T - time_now(),
-  io:format("STARTIGN COUNTER~n"),
-  cache_timer_serv:start_counter(Node, UpdatedKeySet, ?LEASE-TDelta, HitCount, self()),
+  io:format("updated:~p, ~n ", [UpdatedKeySet]),
   %FinishTime = time_now(),
-  %%TODO replace this hardcoded stuff with a hook 
-  %% NO REPLY 
   %riak_core_vnode:reply(OriginalSender, {committed, FinishTime}),
   {reply, ok, State};
 
@@ -265,7 +240,7 @@ pp({_Node,WriteSet}, {TxId, Keys, Hit, Table, Prepared,SizeLimit}) ->
   UpdateItemFun = fun(REcv, Acc) ->
     {Key, Type, {Op, Actor}} = REcv,
     ets:insert(Prepared, {Key}),
-    %%case get_crdt(Table, {{Partition,Node}, Key, Type,TxId}, SizeLimit) of 
+    %case get_crdt(Table, {{Partition,Node}, Key, Type,TxId}, SizeLimit) of 
     case etc:lookup(Table, Key) of
       [{_Key, Object}] ->
         GtSnpShotVal = fun(FObject, FType, FOp, FActor) ->  
@@ -324,7 +299,7 @@ handle_info(Msg, State) ->
 %% =============================================================================
 
 terminate(Reason,  _State) ->
-  io:format("crashing due to :~p ~n", [Reason]),
+  io:format("terminating due to :~p ~n", [Reason]),
   %%ets:tab2file(Table, ?BKUP_FILE),
   %%io:format("cache safely stored to ~w~n", [?BKUP_FILE]),
   ok.
@@ -339,26 +314,20 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% to do: check if the object has been involved in a multikey transaction
 %% if so send all the implicated nodes home at once 
-
-% -record (crdt, {
-%         key :: term(),
-%         snapshot :: term()|[term()],
-%         cache_hits :: integer(),
-%         last_accessed :: term(),
-%         time_created :: term(),
-%         type :: type(),
-%         stable_version :: term(),
-%         borrow_time :: term(),
-%         ops :: [term()]}).
-
-
-
+%% params to send to vnode is this: 
+%% [{{Partition,Node}, [{Key,Type,{Op,Actor/Amount}}]}]
 return_to_owner(Object) ->
   io:format("returning |~p|  ~n", [Object]),  
-  {Key, Type, [Ops|_]} = {Object#crdt.key, Object#crdt.type, Object#crdt.ops},
-  Node = hd(log_util:get_preflist_from_key(Key)),
-  io:format("returning to owner"),
-  clocksi_vnode:single_commit([{Node,{Key,Type, Ops}}]).
+  {Key, Type, [{Op, Actor}|_], TxId} = {Object#crdt.key, Object#crdt.type, Object#crdt.ops, Object#crdt.txId},
+  Node = hd(log_utilities:get_preflist_from_key(Key)),
+  io:format("returning to owner:~p ~n", [[{
+                                  Node, 
+                                  [{Key,Type, {Op, Actor}}] 
+                                }]]),
+  clocksi_vnode:single_commit([{
+                                  Node, 
+                                  [{Key,Type, {Op, Actor}}] 
+                                }], TxId).
 
 
 %% Evicts cache CRDTs using defined strategy until ExtraSizeAmount 
@@ -419,31 +388,25 @@ return_to_owner(Object) ->
 
 %% not cache's 
 
-fetch_cachable_crdt({Partition, Node},Key, Type,TxId) ->
-  io:format("in gect cachable crdt ~n"),
-  case clocksi_readitem_fsm:read_data_item({Partition, Node},Key,Type,TxId) of
-  %case clocksi_vnode:read_data_item({Partition, Node},Key,Type,TxId) of
-    {ok, {_CrdtType, CrdtSnapshot}} -> 
-      io:format("got snapshot ~n"),
-      Object = #crdt{
-          key =  Key,
-          snapshot = CrdtSnapshot,
-          cache_hits  =  0, 
-          last_accessed = 0,
-          time_created  = 0,  
-          type = Type,  
-          stable_version = -1,
-          borrow_time = -1, 
-          ops = [],
-          txId = TxId}, 
-      {ok, Object};
-    {error, Reason} -> 
-      io:format("fetch_cachable_crdt failed due to: ~p, ~n", [Reason]),
-      {error, Reason};
-    SomethingElse->
-      io:format("fetch_cachable_crdt got soemething else: ~p, ~n", [SomethingElse]),
-      SomethingElse
-  end.
+fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
+  case ets:lookup(Table, Key) of
+    [] ->
+      case clocksi_vnode:read_data_item({Partition, Node},Key,Type,TxId) of
+        {ok, {_CrdtType, CrdtSnapshot}} -> 
+          Object = #crdt{ key =  Key, snapshot = CrdtSnapshot, hit_count  =  0, last_accessed = 0,
+                          time_created  = 0, type = Type, stable_version = -1, borrow_time = -1, ops = [], txId = TxId}, 
+          %% start counter only if element has was not previously cached.
+          cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
+          {ok, Object};
+        {error, Reason} -> 
+          {error, Reason}
+      end;
+
+      %%object found in cache. update last_accessdd and increse hit_count
+      [Object] ->
+        UpdatedObject = Object#crdt{ hit_count = Object#crdt.hit_count+1, last_accessed = time_now()},
+        {ok, UpdatedObject}
+   end.
 
 
 % %% TO DO: test this function
@@ -454,7 +417,7 @@ fetch_cachable_crdt({Partition, Node},Key, Type,TxId) ->
 %       false -> Obj2
 %     end
 %   end,
-%   Object = ets:foldl(GetMin, #crdt{cache_hits = ?MAX_INT, 
+%   Object = ets:foldl(GetMin, #crdt{hit_count = ?MAX_INT, 
 %             last_accessed = time_now(),
 %             time_created  = time_now()}, 
 %             Table ),

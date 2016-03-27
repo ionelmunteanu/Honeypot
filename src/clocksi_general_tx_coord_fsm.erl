@@ -144,25 +144,26 @@ execute_batch_ops(timeout,
     [CurrentOps|_RestOps] = Operations, 
     ProcessOp = fun(Operation, {UpdatedParts, RSet, Buffer}) ->
                     case Operation of
+                        
                         {read, Key, Type} ->
-                            {ok, {Type, Snapshot}} = case dict:find(Key, Buffer) of
-                                                    error ->
-                                                        Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
-                                                        IndexNode = hd(Preflist),
-                                                        case ?HONEYPOT of
-                                                            true -> 
-                                                                io:format("using honeypot~n"),
-                                                                cache_serv:read(IndexNode, Key, Type, TxId);
-                                                            _ -> 
-                                                                io:format("bypassing honeypot~n"),
-                                                                ?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId)
-                                                        end;
-                                                    {ok, SnapshotState} ->
-                                                        {ok, {Type,SnapshotState}}
-                                                    end,
-                            Buffer1 = dict:store(Key, Snapshot, Buffer),
+                            Answer = case dict:find(Key, Buffer) of
+                                error ->
+                                    Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
+                                    cache_serv:read(hd(Preflist), Key, Type, TxId); %?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId);
+                                {ok, SnapshotState} ->
+                                    {ok, {Type,SnapshotState}}
+                            end,
+
+                            case Answer of 
+                                {ok, {Type, Snapshot}}-> 
+                                     {UpdatedParts, [Type:value(Snapshot)|RSet], dict:store(Key, Snapshot, Buffer)};
+                                {error, Reason} ->
+                                    io:format("Read operation failed due to: ~p, ~n",[Reason] ),
+                                    {UpdatedParts, RSet, Buffer}
+                            end;
                             %lager:info("New read set is ~w",[RSet]),
-                            {UpdatedParts, [Type:value(Snapshot)|RSet], Buffer1};
+                           
+                        
                         {update, Key, Type, Op} ->
                             Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
                             IndexNode = hd(Preflist),
@@ -186,6 +187,8 @@ execute_batch_ops(timeout,
                             {UpdatedParts1, RSet, Buffer1}
                     end
                 end,
+
+
     {WriteSet1, ReadSet1, _} = lists:foldl(ProcessOp, {dict:new(), [], dict:new()}, CurrentOps),
     %lager:info("Operations are ~w, WriteSet is ~w, ReadSet is ~w",[CurrentOps, WriteSet1, ReadSet1]),
     case dict:size(WriteSet1) of
@@ -194,9 +197,18 @@ execute_batch_ops(timeout,
                 commit_time=clocksi_vnode:now_microsec(now())});
         1->
             UpdatedPart = dict:to_list(WriteSet1),
-            ?CLOCKSI_VNODE:single_commit(UpdatedPart, TxId),
-            {next_state, single_committing,
-            SD#state{state=committing, num_to_ack=1, read_set=ReadSet1, tx_id=TxId}};
+            case ?HONEYPOT of
+                true -> 
+                    io:format("using honeypot with params `:~p~n2:~p~n",[UpdatedPart,TxId]),
+                    Res = cache_serv:update(UpdatedPart,TxId, self()),
+                    io:format("update command has returned with : ~p, ~n", [Res]),
+                    reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, commit_time=clocksi_vnode:now_microsec(now())});
+                _ -> 
+                    io:format("bypassing honeypot~n"),
+                    ?CLOCKSI_VNODE:single_commit(UpdatedPart, TxId),
+                    {next_state, single_committing, SD#state{state=committing, num_to_ack=1, read_set=ReadSet1, tx_id=TxId}}
+            end;
+            
         N->
             ?CLOCKSI_VNODE:prepare(WriteSet1, TxId),
             {next_state, receive_prepared, SD#state{num_to_ack=N, state=prepared,

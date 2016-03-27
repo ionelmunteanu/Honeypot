@@ -33,7 +33,6 @@ start_link() ->
 
 
 init([]) ->   
-io:format("cache timer serv sup init ~n"),     
 {ok,{{one_for_one, 5, 10},
      [{cache_timer_serv,
       {cache_timer_serv,start_link, []},

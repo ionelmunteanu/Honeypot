@@ -31,7 +31,6 @@
 
 
 start_link() ->
-  io:format("starting timer serv:~n"),
   gen_server:start_link({global, ?MODULE}, ?MODULE, [], []).
 
 stop() ->
@@ -46,7 +45,6 @@ start_counter(_Node,TxId, Keys, Lease,HitCount,  From) ->
 %% ===================================================================
 
 init([]) ->
-  io:format("timer sevrer init ~n"),
   Graph = digraph:new(), 
   timer:start(),
   State=#state{graph = Graph},
