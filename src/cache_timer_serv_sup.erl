@@ -33,7 +33,7 @@ start_link() ->
 
 
 init([]) ->   
-{ok,{{one_for_one, 5, 10},
+{ok,{{one_for_one, 10, 10},
      [{cache_timer_serv,
       {cache_timer_serv,start_link, []},
       permanent, 5000, worker,       

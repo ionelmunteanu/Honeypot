@@ -123,6 +123,13 @@ init(_Args) ->
               permanent, 5000, supervisor,
               [cache_timer_serv_sup]},
 
+
+    CommitServSup = {cache_2pc_sup,
+              {cache_2pc_sup, start_link, []},
+              permanent, 5000, supervisor,
+              [cache_2pc_sup]},
+
+
     antidote_config:load("antidote.config"),
 
 
@@ -144,6 +151,7 @@ init(_Args) ->
        %InterDcManager,
        CacheServSup, 
        TimerServSup,
+       CommitServSup,
        VectorClockMaster]}}.
        %InterDcSenderSup,
        %MaterializerMaster]}}.

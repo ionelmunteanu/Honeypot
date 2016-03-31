@@ -16,7 +16,7 @@
     handle_info/2,
     handle_cast/2 ]).
 
--export([start_counter/6]).
+-export([start_counter/5]).
 
 
 %% Graph keeps track of relations between keys of multi-key transactions
@@ -36,8 +36,8 @@ start_link() ->
 stop() ->
   gen_server:cast(?MODULE, stop).
 
-start_counter(_Node,TxId, Keys, Lease,HitCount,  From) ->
-  gen_server:call({global, gen_timer_serv_name()}, {start_counter,TxId, Keys, Lease, HitCount, From} ).
+start_counter(KeyList, TxId, HitCount, Lease, From) ->
+  gen_server:call({global, gen_timer_serv_name()}, {start_counter,TxId, KeyList, Lease, HitCount, From} ).
 
 
 %% ===================================================================
@@ -55,10 +55,11 @@ init([]) ->
 handle_call({start_counter,_TxId, Keys, Lease, HitCount, Sender}, _From, State=#state{graph = Graph}) ->
   %%Reply = case  timer:send_after(Lease, Sender, {lease_expired, Keys, [time_now()]}) of
   insert_dependencies(Keys, Graph),
+  io:format("connected components: ~p, ~n ", [digraph_utils:strong_components(Graph)]), 
   Reply = case HitCount > 0 of
     false ->
-      io:format("Keys send are: ~p~n",[Keys]),
       [Key| _ ] = Keys, 
+      io:format("activating trigger for ~p ~n ",[Key]),
       timer:send_after(Lease, self(), {send_lease_expired, [Key, Sender, Graph]}) ;
     true ->
       ok
@@ -73,13 +74,12 @@ handle_call({cancel_timer, TRef}, _From, State) ->
 
 handle_info({send_lease_expired, [Key, Sender, Graph]},  State=#state{graph = Graph}) ->
   ListOfVertices = digraph_utils:reaching([{Key}], Graph),
-  io:format("list of vertices: ~p~n",[ListOfVertices]),
-
   digraph:del_vertices(Graph, ListOfVertices),
-  io:format("remaining vertices: ~p~n",[digraph:vertices(Graph)]),
   ListOfKeys = [JustKey || {JustKey} <- ListOfVertices],
   io:format("list of expired keys: ~p~n", [ListOfKeys] ),
+  io:format("remaining vertices: ~p~n",[digraph:vertices(Graph)]),
   Sender ! {lease_expired, ListOfKeys},
+
   {noreply, State};
 
 handle_info(_Msg, State) ->
@@ -93,7 +93,7 @@ handle_cast(_Msg, State) ->
 %% ================================================================
 
 insert_dependencies(Keys, Graph) ->
-  io:format(" keys: ~p, ~n",[Keys]),
+  io:format("inserting dependendcies among keys: ~p, ~n",[Keys]),
   InsertDependency = fun (CurrentKey, PrevKey) ->
     case PrevKey of
       [] ->

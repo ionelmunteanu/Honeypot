@@ -7,6 +7,9 @@
 -define(MAX_TABLE_SIZE, 10000).
 -define(MAX_INT, 65535).
 -define(LEASE, 5000).
+
+-define(IF(Cond,Then,Else), (case (Cond) of true -> (Then); false -> (Else) end)).
+
 %%  Eviction strategy based on: 
 %%    - hit_count - least number of demands
 %%    - last_accessed - oldest to be accessed
@@ -30,8 +33,7 @@
         type :: type(),
         stable_version :: term(),
         borrow_time :: term(),
-        ops :: [term()],
-        txId:: term()}).
+        ops :: [term()]}).
 
 %% API
 -export([start_link/0,
@@ -60,6 +62,7 @@
 %% =============================================================================
 
 start_link() ->
+  io:format("cache serve start link "),
   gen_server:start_link({global, ?MODULE}, ?MODULE, [],[]).
 
 stop() ->
@@ -88,8 +91,9 @@ read({Partition, Node}, Key, Type, TxId) ->
 %%  TxId              -> Transaction ID
 %% Returns: - 
 
-update([{{Partition, Node}, WriteSet}], TxId,OriginalSender) ->
-  Answer = gen_server:call({global,gen_cache_name()}, {update, [{{Partition, Node}, WriteSet}], TxId, OriginalSender}),
+%%update([{{Partition, Node}, WriteSet}], TxId,OriginalSender) ->
+update(ListOfOps, TxId,OriginalSender) ->
+  Answer = gen_server:call({global,gen_cache_name()}, {update, ListOfOps, TxId, OriginalSender}),
   io:format("returtning from update gen_serv call: ~p, ~n", [Answer]),
   Answer.
 
@@ -151,7 +155,7 @@ handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{ta
       {error, Reason};
     {ok,Object} ->
       ets:insert(Table, Object),
-      trigger_counter(Object), %% will trigger counter if object has just been cached(i.e. hit count is -1)
+      trigger_counter([Object#crdt.key], TxId, Object#crdt.hit_count),
       {ok,{Type, Object#crdt.snapshot}}
   end,
   {reply, Reply, State};
@@ -161,101 +165,48 @@ handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{ta
 %%{[{Partition,Node}, WriteSet], TxId}
 %% WriteSet = [{Key, Type, {Operation, Actor}}]
 %% TO DO : case of abort! 
-handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, prepared = Prepared}) ->
-
+%%handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, prepared = Prepared}) ->
+handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit}) ->
   UpdateVal = fun(FObject, FType, FOp, FActor) ->  
                 {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
                 Result
               end,
 
-  UpdateItemFun = fun(UpdateOp, Acc) ->
+  UpdateItemFun = fun(UpdateOp, {Acc, TotalHitCount}) ->
     {Key, Type, {Op, Actor}} = UpdateOp,
-    ets:insert(Prepared, {Key}),
-    %%hit count is updated automatically by fetch_catchable_crdt (might break separation of concerns )
+    {Partition, Node} = hd(log_utilities:get_preflist_from_key(Key)),
+    
     case fetch_cachable_crdt({Partition, Node},Key, Type,TxId, Table) of
       {error, Reason} ->
-        io:format("Error has occured while fetching crdt from Vnode.~nReason: ~w~n", [Reason]),
-        {error, Reason};
+        io:format("Error in update handler has occured while fetching crdt from Vnode. Reason: ~w~n", [Reason]),
+        {Acc, TotalHitCount};
 
       {ok, Object} ->
-        UpdatedObject = Object#crdt{snapshot = UpdateVal(Object, Type, Op, Actor),ops= (Object#crdt.ops ++ [{Op, Actor}])},
-        
-        ets:insert(Table, UpdatedObject),
-        %% triggerring will be done only newly inserted key (i.e. hit_count = 0 )and only one
-        %% one key will trigger a chain reaction. 
-        %%trigger_counter(Object),
-        %%case lists:member(Key, Acc) of
-        case Object#crdt.hit_count =:= 0 of
-          true -> lists:append(Acc, [Object]);
-          false -> Acc
-        end
-       
-      end %fetch_cachable_crdt
+        UpdatedObject = Object#crdt{  snapshot = UpdateVal(Object, Type, Op, Actor), 
+                                      ops = (Object#crdt.ops ++ [{Op, Actor, TxId}])},
+        ets:insert(Table, UpdatedObject), 
+        {?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]), TotalHitCount + Object#crdt.hit_count}
+    end %fetch_cachable_crdt
       
-    end, %UpdateItemFun
+  end, %UpdateItemFun
 
-  UpdatedKeySet = lists:foldl(UpdateItemFun,[],WriteSet),
-  io:format("newly inserted:~p, ~n ", [UpdatedKeySet]),
+  UpdateWriteset = fun({_,WSs}, {Ks, Hc}) ->
+    {UKS, THC} = lists:foldl(UpdateItemFun,{[],0},WSs),
+    {Ks++UKS, Hc+THC}
+  end,
+
+  {UpdatedKeySet, TotalHitCount } = lists:foldl(UpdateWriteset, {[],0}, ListOfOperations),
   case UpdatedKeySet of
-    [Head| _DontCare] ->
-      trigger_counter(Head);
-    _ ->
-      no_need_to_trigger
-  end, 
-  {reply, ok, State};
+    [] ->
+      read_servers_not_ready_yet;
+    NotEmpty ->
+      io:format("newly inserted:~p, with total hitcount: ~p ~n ", [NotEmpty, TotalHitCount]),
+      %%trigger_counter(NotEmpty,TxId, TotalHitCount)
+      cache_timer_serv:start_counter(NotEmpty, TxId, TotalHitCount, ?LEASE, self())
+    end,
 
-
-% [
-%   {{0,'antidote@127.0.0.1'}, [{c,riak_dt_gcounter,{increment,c}}, {a,riak_dt_gcounter,{increment,}}]},            
-%   {{730750818665451459101842416358141509827966271488,'antidote@127.0.0.1'},[{m,riak_dt_gcounter,{increment,1}}]}
-% ]
-
-handle_call({update_multi, WriteSetList, TxId,OriginalSender}, _From, 
-            State=#state{table_name = Table, max_table_size = SizeLimit, 
-            prepared = Prepared, node= Node}) ->
-  Ppfun = fun(A, B) -> pp(A,B) end, 
-
-  {_,KeyMulte, HitMulte,_,_,_} = lists:foldl(Ppfun, {TxId, [], 0, Table, Prepared ,SizeLimit},  WriteSetList),
-
-  cache_timer_serv:start_counter(Node, KeyMulte, ?LEASE, HitMulte, self()),
-  lists:map(fun(_X) ->  riak_core_vnode:reply(OriginalSender, {prepared, time_now()}) end, WriteSetList),
   {reply, ok, State}.
 
-
-pp({_Node,WriteSet}, {TxId, Keys, Hit, Table, Prepared,SizeLimit}) ->
-  HitCount = lists:foldl(fun( {K, _Type, {_Op, _Actor}}, Acc) -> 
-                            case ets:lookup(Table,K) of 
-                              [] -> Acc ;
-                               _-> Acc +1 
-                            end 
-                          end, 0, WriteSet),
-  UpdateItemFun = fun(REcv, Acc) ->
-    {Key, Type, {Op, Actor}} = REcv,
-    ets:insert(Prepared, {Key}),
-    %case get_crdt(Table, {{Partition,Node}, Key, Type,TxId}, SizeLimit) of 
-    case etc:lookup(Table, Key) of
-      [{_Key, Object}] ->
-        GtSnpShotVal = fun(FObject, FType, FOp, FActor) ->  
-                          {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
-                          Result
-                        end,
-        UpdatedObject = Object#crdt{
-                          last_accessed = time_now(),
-                          snapshot = GtSnpShotVal(Object, Type, Op, Actor),
-                          ops= (Object#crdt.ops ++ [{Op, Actor}])},
-        ets:insert(Table, UpdatedObject),
-        case lists:member(Key, Acc) of
-          false -> lists:append(Acc, [Key]);
-          true -> Acc
-        end;
-      [] ->
-        {error, not_found}
-      % {error, Reason} ->
-      %   {error, Reason}
-    end
-  end,
-  UpdatedKeySet = lists:foldl(UpdateItemFun,[],WriteSet),
-  {TxId,UpdatedKeySet ++ Keys , Hit+HitCount, Table, Prepared, SizeLimit}.
 
 
 %% =============================================================================
@@ -266,21 +217,59 @@ handle_cast(Msg, State) ->
 
 %% =============================================================================
 
+
+%%{[{Partition,Node}, [{Key, Type, {Operation, Actor}}]], TxId}
+%% WriteSet = 
+
 handle_info({lease_expired, Keys}, State=#state{table_name = Table}) ->
-  Evict = fun(Key) ->
-    case ets:lookup(Table, Key) of
-      [] ->
-        ok; %% crdt not found. maybe deleted by make_room
-      [Result] ->
-        case length(Result#crdt.ops) > 0 of 
-          true ->
-            return_to_owner(Result);
-          _ -> ok
-        end, 
-        ets:delete_object(Table, Result)
+  io:format("lease expired on keys: ~p~n ",[Keys]),
+  
+  MapCommitTxs = fun(Value , Acc) ->
+    {Transaction, Rest} = Value,
+    case dict:is_key(Transaction, Acc) of
+        false ->
+            dict:store(Transaction, [Rest], Acc);
+        true ->
+            dict:append(Transaction, Rest, Acc)
     end
   end,
-  lists:map(Evict, Keys),
+
+
+  FlatmapOps = fun(Key, Acc) ->
+    case ets:lookup(Table, Key) of
+      [] ->
+        Acc; %% crdt not found. maybe deleted by make_room
+      [Result] ->
+        Answ = case length(Result#crdt.ops) > 0 of 
+          true ->
+            %this flatmaps the operations/transactions per key. A key may be updated in multipel transactions. 
+            % this must be reflected in the log. 
+            Acc ++ [{Tx, {get_location(Result#crdt.key), {Result#crdt.key, Result#crdt.type, {Op, Actor}}}} || {Op, Actor, Tx} <- Result#crdt.ops];
+          _ -> 
+            Acc
+        end,
+        %%ets:delete_object(Table, Result), %%what if this fails? 
+        Answ
+    end
+  end,
+
+  %make dictionary from list having the transactions as keys and as values list of type [{location,{key,type,{op, actor}}}|_rest]
+
+  Fm = lists:foldl(FlatmapOps, [], Keys), 
+
+  TxDict = lists:foldl(MapCommitTxs, dict:new(), Fm),
+
+  TxHandover = fun(Tx, Ops, Acc) ->
+    ND = lists:foldl(MapCommitTxs, dict:new(), Ops),
+    cache_2pc_sup:start_worker( Tx, ND, self()),
+    %Acc++clocksi_vnode:prepare(ND, Tx)
+    Acc
+  end,
+
+  dict:fold(TxHandover, [], TxDict), 
+
+  %io:format("overallResult:~p~n",[OverallResult]),
+
   {noreply, State};
 
 handle_info(Msg, State) ->
@@ -303,15 +292,13 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 
 
+get_location(Key) -> hd(log_utilities:get_preflist_from_key(Key)).
+
 %% to do: check if the object has been involved in a multikey transaction
 %% if so send all the implicated nodes home at once 
 %% params to send to vnode is this: 
 %% [{{Partition,Node}, [{Key,Type,{Op,Actor/Amount}}]}]
-return_to_owner(Object) ->
-  io:format("returning: ~p  ~n", [Object]),  
-  {Key, Type, [{Op, Actor}|_], TxId} = {Object#crdt.key, Object#crdt.type, Object#crdt.ops, Object#crdt.txId},
-  Node = hd(log_utilities:get_preflist_from_key(Key)),
-  clocksi_vnode:single_commit([{Node, [{Key,Type, {Op, Actor}}] }], TxId).
+
 
 
 %% Evicts cache CRDTs using defined strategy until ExtraSizeAmount 
@@ -337,39 +324,6 @@ return_to_owner(Object) ->
 %   end.
 
 
-
-
-
-
-% cache_crdt(Table, Node, Key, Type, TxId, SizeLimit) ->
-%   Result = case ets:lookup(Table, Key) of 
-%     [] ->
-%       case fetch_cachable_crdt(Node, Key, Type,TxId) of
-%         {ok, FetchedObj} ->
-%           io:format("sending start counter data~n "),
-%           cache_timer_serv:start_counter(Partition, TxId, [Key], ?LEASE, self()),
-%           {ok,FetchedObj};
-%         {error, Reason} ->
-%           {error, Reason}
-%       end;
-%     [Answer] ->
-%        {ok,Answer};
-%     ListOfAnsweres ->
-%       ListOfAnsweres  
-%     end,
-%   case Result of
-%     {ok, Obj} ->
-%       %make_room(Table, SizeLimit, Obj),
-%       {ok, Obj};
-%     {error, ErrMsg} ->
-%       {error, ErrMsg};
-%     Rest ->
-%       [Head|_] = Rest, 
-%       {ok, Head}
-%   end.
-
-
-
 %% not cache's 
 
 fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
@@ -378,7 +332,7 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
       case clocksi_vnode:read_data_item({Partition, Node},Key,Type,TxId) of
         {ok, {_CrdtType, CrdtSnapshot}} -> 
           Object = #crdt{ key =  Key, snapshot = CrdtSnapshot, hit_count  =  0, last_accessed = 0,
-                          time_created  = 0, type = Type, stable_version = -1, borrow_time = -1, ops = [], txId = TxId}, 
+                          time_created  = 0, type = Type, stable_version = -1, borrow_time = -1, ops = []}, 
           %% start counter only if element has was not previously cached.
           %% not a good ideea since it might trigger a counter for a key linked to a previous cachef one by a transaction id
           %cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
@@ -395,13 +349,23 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
 
 
 %%Caled in case of a read or single update. If object has just been cached, its hitcount is -1. This means a counter has never been trigger for this key
-%%
+%% When an object is cached, its hit_count is 0. In this situation, a trigger is created for this one object. When the timer expires, an event is 
+%% generated and the updated object is sent back to its owner. 
+%% If a multi-key transaction involves an already cached object,for which a trigger has already been activated, (and, without loosing generality, we can 
+%% suppose it's the earliest cached object in this multi-key transaction), once the trigger is fired, all the objects involved must be sent back (to maintain 
+%% isolation). The oldest object in this transaction, say X, will have a hit_count of 0. Upon calling it the second time, X's hit count will be 1 and all the 
+%% other objects will have 0. This is how we can detect that at least one trigger from the whole chain has been activated. When X will be handed back, all 
+%% the chain will be sent along to its owners.
+%% 
+%% @param KeyList - list of keys involved in this transaction
+%% @param TotalHitCount - if it is 0 a trigger will be set
+%%    
 
-trigger_counter(Object) ->
-  case Object#crdt.hit_count =:= 0 of
+trigger_counter(KeyList, TxId, TotalHitCount) ->
+  io:format("trigger_counter: ~p ~n", [{KeyList, TxId, TotalHitCount}]),
+  case TotalHitCount =:= 0 of
     true -> 
-      cache_timer_serv:start_counter( hd(log_utilities:get_preflist_from_key(Object#crdt.key)),
-                                        Object#crdt.txId, [Object#crdt.key], ?LEASE, -1, self());
+      cache_timer_serv:start_counter(KeyList,TxId, TotalHitCount, ?LEASE, self());
     _ ->
       ok
   end.
