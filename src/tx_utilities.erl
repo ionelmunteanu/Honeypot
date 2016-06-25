@@ -34,7 +34,7 @@ create_transaction_record(ClientClock) ->
         _ ->
             get_snapshot_time(ClientClock)
     end,
-    TransactionId = #tx_id{snapshot_time=SnapshotTime, server_pid=self()},
+    TransactionId = #tx_id{snapshot_time=SnapshotTime, server_pid=self(), borrower=erlang:node()},
     TransactionId.
 
 %%@doc Set the transaction Snapshot Time to the maximum value of:

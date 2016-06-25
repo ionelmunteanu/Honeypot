@@ -46,7 +46,10 @@
 
 -define(CLOCKSI_TIMEOUT, 1000).
 
--record(tx_id, {snapshot_time, server_pid :: pid()}).
+%% node is added to the original tx_id to support honeypot's distributed caching protocol
+%% when set, a request fill be fulfilled function of the the key, timestamp and previous 
+%% borrowing nodes
+-record(tx_id, {snapshot_time, server_pid :: pid(), borrower}).
 -record(clocksi_payload, {key :: key(),
                           type :: type(),
                           op_param :: op(),

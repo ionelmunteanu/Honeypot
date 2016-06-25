@@ -28,7 +28,7 @@
 	    get_cache_name/2,
         set_prepared/4,
         async_send_msg/2,
-        update_store/4,
+        update_store/5,
 
         check_prepared/3,
         prepare/2,
@@ -74,7 +74,9 @@
                 if_certify :: boolean(),
                 if_replicate :: boolean(),
                 quorum :: non_neg_integer(),
-                inmemory_store :: cache_id()}).
+                inmemory_store :: cache_id(),
+                key_version_store,
+                lent_keys}).
 
 %%%===================================================================
 %%% API
@@ -147,10 +149,12 @@ init([Partition]) ->
     CommittedTx = dict:new(),
     %%true = ets:insert(TxMetadata, {committed_tx, dict:new()}),
     InMemoryStore = open_table(Partition, inmemory_store),
-    
+    KeyVersions = open_table(Partition, key_version_store),
+    LentObjects = ets:new(get_cache_name(Partition,lent_obj_buff),
+        [set,public,named_table,?TABLE_CONCURRENCY]),
     clocksi_readitem_fsm:start_read_servers(Partition),
-
-    IfCertify = antidote_config:get(do_cert),
+    %%IfCertify = antidote_config:get(do_cert),
+    IfCertify = false,
     IfReplicate = antidote_config:get(do_repl),
     Quorum = antidote_config:get(quorum),
 
@@ -167,7 +171,9 @@ init([Partition]) ->
                 quorum = Quorum,
                 if_certify = IfCertify,
                 if_replicate = IfReplicate,
-                inmemory_store=InMemoryStore}}.
+                inmemory_store = InMemoryStore,
+                key_version_store = KeyVersions, 
+                lent_keys=LentObjects}}.
 
 
 check_tables_ready() ->
@@ -256,6 +262,7 @@ handle_command({prepare, TxId, WriteSet, OriginalSender}, _Sender,
     %[{committed_tx, CommittedTx}] = ets:lookup(TxMetadata, committed_tx),
     Result = prepare(TxId, WriteSet, CommittedTx, TxMetadata, 
                         PrepareTime, IfCertify),
+    io:format("clocsi vnode: result of prepare ~p~n",[Result]),
     case Result of
         {ok, NewPrepare} ->
             case IfReplicate of
@@ -361,12 +368,12 @@ handle_command({commit, TxId, TxCommitTime, Updates}, Sender,
 handle_command({abort, TxId, Updates}, _Sender,
                #state{partition=_Partition} = State) ->
     case Updates of
-        [_Something] -> 
-            clean_and_notify(TxId, Updates, State),
-            {noreply, State};
-            %%{reply, ack_abort, State};
         [] ->
-            {reply, {error, no_tx_record}, State}
+            {reply, {error, no_tx_record}, State};
+        _NotNull-> 
+            clean_and_notify(TxId, Updates, State),
+            {noreply, State}
+            %%{reply, ack_abort, State};
     end;
 
 %% @doc Return active transactions in prepare state with their preparetime
@@ -428,7 +435,7 @@ async_send_msg(Msg, To) ->
     timer:sleep(SleepTime),
     riak_core_vnode_master:command(To, Msg, To, ?CLOCKSI_MASTER).
 
-prepare(TxId, TxWriteSet, CommittedTx, TxMetadata, PrepareTime, IfCertify)->
+prepare(TxId, TxWriteSet, CommittedTx, TxMetadata, PrepareTime, IfCertify)-> 
     case certification_check(TxId, TxWriteSet, CommittedTx, TxMetadata, IfCertify) of
         true ->
             %case TxWriteSet of 
@@ -459,11 +466,27 @@ set_prepared(TxMetadata,[{Key, _Type, _Op} | Rest],TxId,Time) ->
     true = ets:insert(TxMetadata, {Key, {TxId, Time}}),
     set_prepared(TxMetadata,Rest,TxId,Time).
 
-commit(TxId, TxCommitTime, Updates, CommittedTx, 
-                                State=#state{inmemory_store=InMemoryStore})->
+commit(TxId, TxCommitTime, Updates, CommittedTx, State=#state{inmemory_store=InMemoryStore, 
+        lent_keys = LentObjects, key_version_store = KeyVersions})->
     case Updates of
         [{Key, _Type, _Value} | _Rest] -> 
-            update_store(Updates, TxId, TxCommitTime, InMemoryStore),
+            case ets:lookup(LentObjects, Key) of 
+                [] ->
+                    io:format("error, key not found~n");
+                [{Key, Dictionary}] ->
+                    case dict:is_key(TxId#tx_id.borrower, Dictionary) of
+                        false ->
+                             io:format("error, 'borrowing node not found'~n");
+                        true ->
+                            case dict:size(Dictionary) of
+                                1 ->
+                                    ets:delete(LentObjects, Key);
+                                _ ->
+                                    ets:insert(LentObjects, {Key, dict:erase(TxId#tx_id.borrower, Dictionary)})
+                            end
+                    end
+            end,
+            update_store(Updates, TxId, TxCommitTime, InMemoryStore, KeyVersions),
             NewDict = dict:store(Key, TxCommitTime, CommittedTx),
             clean_and_notify(TxId,Updates,State),
             {ok, {committed, NewDict}};
@@ -515,6 +538,7 @@ certification_check(_, [], _, _, true) ->
 certification_check(TxId, [H|T], CommittedTx, TxMetadata, true) ->
     SnapshotTime = TxId#tx_id.snapshot_time,
     {Key, _Type, _} = H,
+    io:format("txId:~p, key:~p, commitedTx:~p  and the metadata:~p ~n ", [TxId, Key, dict:to_list(CommittedTx), ets:tab2list(TxMetadata)]),
     case dict:find(Key, CommittedTx) of
         {ok, CommitTime} ->
             case CommitTime > SnapshotTime of
@@ -578,12 +602,11 @@ check_prepared(TxId, TxMetadata, Key) ->
 %%             check_keylog(TxId, T, CommittedTx)
 %%     end.
 
--spec update_store(KeyValues :: [{key(), atom(), term()}],
-                          TxId::txid(),TxCommitTime:: {term(), term()},
-                                InMemoryStore :: cache_id()) -> ok.
-update_store([], _TxId, _TxCommitTime, _InMemoryStore) ->
+-spec update_store(KeyValues :: [{key(), atom(), term()}], TxId::txid(),TxCommitTime:: {term(), term()},
+                                InMemoryStore :: cache_id(), KeyVersions :: cache_id()) -> ok.
+update_store([], _TxId, _TxCommitTime, _InMemoryStore, _KeyVersions) ->
     ok;
-update_store([{Key, Type, {Param, Actor}}|Rest], TxId, TxCommitTime, InMemoryStore) ->
+update_store([{Key, Type, {Param, Actor}}|Rest], TxId, TxCommitTime, InMemoryStore, KeyVersions) ->
     %lager:info("Store ~w",[InMemoryStore]),
     case ets:lookup(InMemoryStore, Key) of
         [] ->
@@ -591,16 +614,18 @@ update_store([{Key, Type, {Param, Actor}}|Rest], TxId, TxCommitTime, InMemorySto
             Init = Type:new(),
             {ok, NewSnapshot} = Type:update(Param, Actor, Init),
             %lager:info("Updateing store for key ~w, value ~w firstly", [Key, Type:value(NewSnapshot)]),
+            ets:insert(KeyVersions, {Key, 0}), 
             true = ets:insert(InMemoryStore, {Key, [{TxCommitTime, NewSnapshot}]}), 
-            update_store(Rest, TxId, TxCommitTime, InMemoryStore);
+            update_store(Rest, TxId, TxCommitTime, InMemoryStore, KeyVersions);
         [{Key, ValueList}] ->
       %      lager:info("Wrote ~w to key ~w with ~w",[Value, Key, ValueList]),
             {RemainList, _} = lists:split(min(20,length(ValueList)), ValueList),
             [{_CommitTime, First}|_] = RemainList,
+            ets:update_counter(KeyVersions, Key, {2, 1}), 
             {ok, NewSnapshot} = Type:update(Param, Actor, First),
             %lager:info("Updateing store for key ~w, value ~w", [Key, Type:value(NewSnapshot)]),
             true = ets:insert(InMemoryStore, {Key, [{TxCommitTime, NewSnapshot}|RemainList]}),
-            update_store(Rest, TxId, TxCommitTime, InMemoryStore)
+            update_store(Rest, TxId, TxCommitTime, InMemoryStore, KeyVersions)
     end,
     ok.
 

@@ -7,6 +7,7 @@
 -define(MAX_TABLE_SIZE, 10000).
 -define(MAX_INT, 65535).
 -define(LEASE, 5000).
+-define(MAX_RETRIES, 5).
 
 -define(IF(Cond,Then,Else), (case (Cond) of true -> (Then); false -> (Else) end)).
 
@@ -20,8 +21,9 @@
         tmr_serv_id :: term(),
         backup_file :: term(),
         max_table_size :: integer(),
-        prepared :: term(),
+        keys_with_hit_count :: term(),
         partition :: term(),
+        keys_per_tx :: term(),
         node :: term()}).
 
 -record (crdt, {
@@ -63,7 +65,7 @@
 
 start_link() ->
   io:format("cache serve start link "),
-  gen_server:start_link({global, ?MODULE}, ?MODULE, [],[]).
+  gen_server:start_link({local, ?MODULE}, ?MODULE, [],[]).
 
 stop() ->
     gen_server:cast(?MODULE, stop).
@@ -80,7 +82,7 @@ stop() ->
 %%  {ok, {Type, Value}}
 
 read({Partition, Node}, Key, Type, TxId) ->
-  gen_server:call({global, cache_serv}, {read, {{Partition, Node}, Key, Type, TxId}}).
+  gen_server:call( cache_serv, {read, {{Partition, Node}, Key, Type, TxId}}).
 
 
 %% Calls a callback responsable with updating items in the cache, similar to 
@@ -93,20 +95,20 @@ read({Partition, Node}, Key, Type, TxId) ->
 
 %%update([{{Partition, Node}, WriteSet}], TxId,OriginalSender) ->
 update(ListOfOps, TxId,OriginalSender) ->
-  Answer = gen_server:call({global,gen_cache_name()}, {update, ListOfOps, TxId, OriginalSender}),
+  Answer = gen_server:call(gen_cache_name(), {update, ListOfOps, TxId, OriginalSender}),
   io:format("returtning from update gen_serv call: ~p, ~n", [Answer]),
   Answer.
 
 
 
 update_multi([{{Partition, Node}, WriteSet}|Rest], TxId, OriginalSender) ->
-    gen_server:call({global,gen_cache_name()}, {update_multi, [{{Partition, Node}, WriteSet}|Rest], TxId, OriginalSender}).
+    gen_server:call(gen_cache_name(), {update_multi, [{{Partition, Node}, WriteSet}|Rest], TxId, OriginalSender}).
 
 cache_info(Item) ->
   ets:info(?CACHE, Item).   
 
 simple_lookup(_Node, Key, Type, _TxId) ->
-  gen_server:call({global,gen_cache_name()}, {simple_lookup,Key, Type}).
+  gen_server:call(gen_cache_name(), {simple_lookup,Key, Type}).
 
 start_cache_serv(Node) ->
   cache_serv_sup:start_cache(Node).
@@ -120,11 +122,13 @@ init([]) ->
   %% do i need to generate a table name as well? don't think so...to do: check
   Table = ets:new(gen_table_name(), [set, named_table, {keypos, #crdt.key}]),
   Prepared = ets:new(gen_prepare_name(), [set, named_table]),
+  KeysPerTx = ets:new(keys_per_tx, [set, named_table]),
   {ok, #state{table_name = Table,
         tmr_serv_id = gen_timer_serv_name(),
         backup_file = ?BKUP_FILE,
         max_table_size = ?MAX_TABLE_SIZE,
-        prepared = Prepared,
+        keys_with_hit_count = Prepared,
+        keys_per_tx = KeysPerTx,
         node= 1}}.
 
 
@@ -184,6 +188,7 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
       {ok, Object} ->
         UpdatedObject = Object#crdt{  snapshot = UpdateVal(Object, Type, Op, Actor), 
                                       ops = (Object#crdt.ops ++ [{Op, Actor, TxId}])},
+        make_room(Table, ?MAX_TABLE_SIZE, UpdatedObject),
         ets:insert(Table, UpdatedObject), 
         {?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]), TotalHitCount + Object#crdt.hit_count}
     end %fetch_cachable_crdt
@@ -196,16 +201,18 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
   end,
 
   {UpdatedKeySet, TotalHitCount } = lists:foldl(UpdateWriteset, {[],0}, ListOfOperations),
-  case UpdatedKeySet of
+  
+  Reply = case UpdatedKeySet of
     [] ->
-      read_servers_not_ready_yet;
+      {error,'Read servers not ready yet'};
     NotEmpty ->
       io:format("newly inserted:~p, with total hitcount: ~p ~n ", [NotEmpty, TotalHitCount]),
       %%trigger_counter(NotEmpty,TxId, TotalHitCount)
-      cache_timer_serv:start_counter(NotEmpty, TxId, TotalHitCount, ?LEASE, self())
+      cache_timer_serv:start_counter(NotEmpty, TxId, TotalHitCount, ?LEASE, self()),
+      ok
     end,
 
-  {reply, ok, State}.
+  {reply, Reply, State}.
 
 
 
@@ -221,7 +228,7 @@ handle_cast(Msg, State) ->
 %%{[{Partition,Node}, [{Key, Type, {Operation, Actor}}]], TxId}
 %% WriteSet = 
 
-handle_info({lease_expired, Keys}, State=#state{table_name = Table}) ->
+handle_info({lease_expired, Keys}, State=#state{table_name = Table, keys_with_hit_count = Prepared}) ->
   io:format("lease expired on keys: ~p~n ",[Keys]),
   
   MapCommitTxs = fun(Value , Acc) ->
@@ -248,7 +255,7 @@ handle_info({lease_expired, Keys}, State=#state{table_name = Table}) ->
           _ -> 
             Acc
         end,
-        %%ets:delete_object(Table, Result), %%what if this fails? 
+        ets:delete_object(Table, Result), %%what if this fails? 
         Answ
     end
   end,
@@ -256,11 +263,12 @@ handle_info({lease_expired, Keys}, State=#state{table_name = Table}) ->
   %make dictionary from list having the transactions as keys and as values list of type [{location,{key,type,{op, actor}}}|_rest]
 
   Fm = lists:foldl(FlatmapOps, [], Keys), 
-
   TxDict = lists:foldl(MapCommitTxs, dict:new(), Fm),
 
   TxHandover = fun(Tx, Ops, Acc) ->
     ND = lists:foldl(MapCommitTxs, dict:new(), Ops),
+    ets:insert(Prepared, {Tx, ND, ?MAX_RETRIES}),
+    %%TODO replace whit with a pool of workers
     cache_2pc_sup:start_worker( Tx, ND, self()),
     %Acc++clocksi_vnode:prepare(ND, Tx)
     Acc
@@ -272,8 +280,26 @@ handle_info({lease_expired, Keys}, State=#state{table_name = Table}) ->
 
   {noreply, State};
 
-handle_info(Msg, State) ->
-  io:format("received in info :~p  ~n", [Msg]),
+handle_info(Msg, State=#state{ keys_with_hit_count = Prepared}) ->
+  case Msg of
+    {ok, {TxId, CommitTime}} ->
+      io:format("TxId has commited :~p  ~n", [{TxId,CommitTime}]),
+      ets:delete(Prepared, TxId),
+      ok;
+    {error, {TxId, commit_fail}} ->
+      [{Tx, ND, Retries}] = ets:lookup(Prepared, TxId),
+      case Retries of 
+        0 ->
+          io:format("no more retries for ~p~n",[Tx]), 
+          ets:delete(Prepared,TxId);
+        N ->
+          io:format("failed delivering : ~p, ~nretrying~n",[TxId]), 
+          cache_2pc_sup:start_worker( Tx, ND, self()),
+          ets:insert(Prepared, {TxId, ND, N-1})
+        end;
+    Else ->
+      io:format("received in info :~p  ~n", [Else])
+    end,
   {noreply, State}.
 
 %% =============================================================================
@@ -301,35 +327,13 @@ get_location(Key) -> hd(log_utilities:get_preflist_from_key(Key)).
 
 
 
-%% Evicts cache CRDTs using defined strategy until ExtraSizeAmount 
-%% space is cleared from the cache
-% make_room(Table, SizeLimit, Object) ->
-%   ExtraSizeAmount = case ets:lookup(Table, Object#crdt.key) of
-%     [] ->
-%       %%need to store the entire object
-%       size(term_to_binary(Object));   
-%     _ ->
-%       %%need to store only the ops
-%       size(term_to_binary(Object#crdt.ops))   
-%   end,
-%   io:format("ExtraSizeAmount:~B;SizeLimit: ~B~n",[ExtraSizeAmount,SizeLimit]),
-%   case ((ets:info(Table, memory) + ExtraSizeAmount) < SizeLimit) of
-%     true ->
-%       io:format("there is enough space~n") ,
-%       ok; %% to do make rcusive and return list ??
-%     false -> 
-%       io:format ("there is not enough space~n") ,
-%       evict(Table),
-%       make_room(Table, SizeLimit, Object)
-%   end.
-
 
 %% not cache's 
 
 fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
   case ets:lookup(Table, Key) of
     [] ->
-      case clocksi_vnode:read_data_item({Partition, Node},Key,Type,TxId) of
+      case clocksi_vnode:read_data_item({Partition, Node}, Key, Type, TxId) of
         {ok, {_CrdtType, CrdtSnapshot}} -> 
           Object = #crdt{ key =  Key, snapshot = CrdtSnapshot, hit_count  =  0, last_accessed = 0,
                           time_created  = 0, type = Type, stable_version = -1, borrow_time = -1, ops = []}, 
@@ -370,24 +374,48 @@ trigger_counter(KeyList, TxId, TotalHitCount) ->
       ok
   end.
 
-% %% TO DO: test this function
-% evict(Table) ->
-%   GetMin = fun (Obj1, Obj2) -> 
-%     case Obj1#crdt.?EVICT_STRAT_FIELD < Obj2#crdt.?EVICT_STRAT_FIELD of 
-%       true -> Obj1;
-%       false -> Obj2
-%     end
-%   end,
-%   Object = ets:foldl(GetMin, #crdt{hit_count = ?MAX_INT, 
-%             last_accessed = time_now(),
-%             time_created  = time_now()}, 
-%             Table ),
-%   io:format("evicting ~p ~n",[Object]),
-%   ets:delete(Table, Object#crdt.key),
-%   if Object =/= []  ->
-%     return_to_owner(Object) %% to do optimization, do not return Object if ops is empty. but needed for buffer => causality
-%   end,
-%   ok.
+
+
+% %% Evicts cache CRDTs using defined strategy until ExtraSizeAmount 
+% %% space is cleared from the cache
+make_room(Table, SizeLimit, Object) ->
+  ExtraSizeAmount = case ets:lookup(Table, Object#crdt.key) of
+    [] ->
+      %%need to store the entire object
+      size(term_to_binary(Object));   
+    _ ->
+      %%need to store only the ops
+      size(term_to_binary(Object#crdt.ops))   
+  end,
+  io:format("ExtraSizeAmount:~B;SizeLimit: ~B~n",[ExtraSizeAmount,SizeLimit]),
+  case ((ets:info(Table, memory) + ExtraSizeAmount) < SizeLimit) of
+    true ->
+      io:format("there is enough space~n") ,
+      ok; %% to do make rcusive and return list ??
+    false -> 
+      io:format ("there is not enough space~n") ,
+      evict(Table),
+      make_room(Table, SizeLimit, Object)
+  end.
+
+
+
+
+% % %% TO DO: test this function
+evict(Table) ->
+  GetMin = fun (Obj1, Obj2) -> 
+    case Obj1#crdt.?EVICT_STRAT_FIELD < Obj2#crdt.?EVICT_STRAT_FIELD of 
+      true -> Obj1;
+      false -> Obj2
+    end
+  end,
+  Object = ets:foldl(GetMin, #crdt{hit_count = ?MAX_INT, 
+            last_accessed = time_now(), 
+            time_created  = time_now()}, 
+            Table ),
+  io:format("evicting ~p ~n",[Object]),
+  cache_timer_serv:start_counter([Object#crdt.key], 0, 0, 0, self()),
+  ok.
 
 
 

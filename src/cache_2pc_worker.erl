@@ -91,7 +91,6 @@ init([TxId, WriteSet, From]) ->
     prepare_time=0,
     tx_id = TxId
   },
-  io:format("2pc: writeset to be commited :~p, ~n",[{TxId, WriteSet}]),
   case dict:size(WriteSet) > 1 of 
     false ->
       ?CLOCKSI_VNODE:single_commit(dict:to_list(WriteSet), TxId),
@@ -191,29 +190,30 @@ reply_to_client(SD=#state{from=From, tx_id=TxId, state=TxState, commit_time=Comm
       From ! {ok, {TxId, CommitTime}},
       {stop, normal, SD};
     aborted ->
-      From ! {error, commit_fail},
+      From ! {error, {TxId, commit_fail}},
       {stop, normal, SD}
   end.
 
 %% =============================================================================
 
 handle_info(Info, _StateName, StateData) ->
-    io:format("handle info ~p, ~n",[Info]),
+    io:format("clock si vnode handle info ~p, ~n",[Info]),
     {stop,badmsg,StateData}.
 
 handle_event(Event, _StateName, StateData) ->
-    io:format("handle event ~p, ~n",[Event]),
+    io:format("clock si vnode  handle event ~p, ~n",[Event]),
     {stop,badmsg,StateData}.
 
 handle_sync_event(stop,_From,_StateName, StateData) ->
     {stop,normal,ok, StateData};
 
 handle_sync_event(Event, _From, _StateName, StateData) ->
-    io:format("handle SYNC event ~p, ~n",[Event]),
+    io:format("clock si vnode  handle SYNC event ~p, ~n",[Event]),
     {stop,badmsg,StateData}.
 
 code_change(_OldVsn, StateName, State, _Extra) -> {ok, StateName, State}.
 
 terminate(_Reason, _SN, _SD) ->
+    io:format("worker terminating~n"),
     ok.
 

@@ -18,12 +18,13 @@
 
 -export([start_counter/5]).
 
+-define(IF(Cond,Then,Else), (case (Cond) of true -> (Then); false -> (Else) end)).
 
 %% Graph keeps track of relations between keys of multi-key transactions
 %% Table is a key-value store where key denotes a crdt and the value is its timer reference
 %% it is used to cancel timers for keys in multi-key transction. 
 %%
--record(state, {graph :: term()}).
+-record(state, {graph :: term(), timer_store :: term()}).
   
 %% ===================================================================
 %% API
@@ -31,13 +32,13 @@
 
 
 start_link() ->
-  gen_server:start_link({global, ?MODULE}, ?MODULE, [], []).
+  gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 stop() ->
   gen_server:cast(?MODULE, stop).
 
 start_counter(KeyList, TxId, HitCount, Lease, From) ->
-  gen_server:call({global, gen_timer_serv_name()}, {start_counter,TxId, KeyList, Lease, HitCount, From} ).
+  gen_server:call( gen_timer_serv_name(), {start_counter,TxId, KeyList, Lease, HitCount, From} ).
 
 
 %% ===================================================================
@@ -46,8 +47,9 @@ start_counter(KeyList, TxId, HitCount, Lease, From) ->
 
 init([]) ->
   Graph = digraph:new(), 
+  Store = ets:new(?STORE, [set, named_table]), 
   timer:start(),
-  State=#state{graph = Graph},
+  State=#state{graph = Graph, timer_store = Store},
   {ok, State}.
 
 %% ================================================================
@@ -60,7 +62,8 @@ handle_call({start_counter,_TxId, Keys, Lease, HitCount, Sender}, _From, State=#
     false ->
       [Key| _ ] = Keys, 
       io:format("activating trigger for ~p ~n ",[Key]),
-      timer:send_after(Lease, self(), {send_lease_expired, [Key, Sender, Graph]}) ;
+      {ok, TRef} = timer:send_after(Lease, self(), {send_lease_expired, [Key, Sender]}),
+      insert_dependencies([Key, {tref, TRef}], Graph);
     true ->
       ok
     end,
@@ -72,10 +75,19 @@ handle_call({cancel_timer, TRef}, _From, State) ->
 
 %% ================================================================
 
-handle_info({send_lease_expired, [Key, Sender, Graph]},  State=#state{graph = Graph}) ->
+handle_info({send_lease_expired, [Key, Sender]},  State=#state{graph = Graph}) ->
   ListOfVertices = digraph_utils:reaching([{Key}], Graph),
+
+  ListOfKeys = lists:foldl(
+    fun(Val,A1) -> 
+      case Val of 
+        {tref, TRef} -> timer:cancel(TRef); 
+        {V} -> [V|A1] 
+      end 
+    end, [], ListOfVertices),
+  
   digraph:del_vertices(Graph, ListOfVertices),
-  ListOfKeys = [JustKey || {JustKey} <- ListOfVertices],
+  %% [JustKey || {JustKey} <- ListOfVertices],
   io:format("list of expired keys: ~p~n", [ListOfKeys] ),
   io:format("remaining vertices: ~p~n",[digraph:vertices(Graph)]),
   Sender ! {lease_expired, ListOfKeys},

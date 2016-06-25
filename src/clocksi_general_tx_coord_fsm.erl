@@ -141,15 +141,17 @@ execute_batch_ops(timeout,
                     operations=Operations
 		      }) ->
     TxId = tx_utilities:create_transaction_record(CausalClock),
+    io:format("process name is: ~p ~n", [TxId] ),
     [CurrentOps|_RestOps] = Operations, 
     ProcessOp = fun(Operation, {UpdatedParts, RSet, Buffer}) ->
                     case Operation of
                         
-                        {read, Key, Type} ->
+                        {read, Key, Type, PrevNode} ->
                             Answer = case dict:find(Key, Buffer) of
                                 error ->
                                     Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
-                                    cache_serv:read(hd(Preflist), Key, Type, TxId); %?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId);
+                                    cache_serv:read(hd(Preflist), Key, Type, TxId#tx_id{borrower=PrevNode}); 
+                                    %?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId);
                                 {ok, SnapshotState} ->
                                     {ok, {Type,SnapshotState}}
                             end,
