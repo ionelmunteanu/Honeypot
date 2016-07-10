@@ -9,7 +9,7 @@
 %%
 %%   http://www.apache.org/licenses/LICENSE-2.0
 %%
-%% Unless required by applicable law or agreed to in writing,
+%% Unless required by applicable law or agr`eed to in writing,
 %% software distributed under the License is distributed on an
 %% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 %% KIND, either express or implied.  See the License for the
@@ -56,7 +56,8 @@
 		prepared_cache :: cache_id(),
 		self :: atom(),
         pending_requests :: cache_id(),
-        lent_obj_buff}).
+        lent_obj_buff, 
+        key_version_store}).
 
 %%%===================================================================
 %%% API
@@ -160,23 +161,27 @@ init([Partition, Id]) ->
     SnapshotCache = clocksi_vnode:get_cache_name(Partition,inmemory_store),
     PreparedCache = clocksi_vnode:get_cache_name(Partition,prepared),
     LentObjects = clocksi_vnode:get_cache_name(Partition, lent_obj_buff),
+    KeyVersions = clocksi_vnode:get_cache_name(Partition,key_version_store),
+    
     Self = generate_server_name(Addr,Partition,Id),
+    
     {ok, #state{partition=Partition, id=Id, 
 		snapshot_cache=SnapshotCache,
 		prepared_cache=PreparedCache,self=Self,
-        lent_obj_buff = LentObjects}}.
+        lent_obj_buff = LentObjects,
+        key_version_store=KeyVersions}}.
 
 handle_call({perform_read, Key, Type, TxId},Coordinator,
-	    SD0=#state{snapshot_cache=SnapshotCache,prepared_cache=PreparedCache,self=Self, lent_obj_buff = LentObjects}) ->
-    perform_read_internal({sync,Coordinator},Key,Type,TxId, SnapshotCache,PreparedCache, LentObjects,Self),
+	    SD0=#state{snapshot_cache=SnapshotCache,prepared_cache=PreparedCache,self=Self, lent_obj_buff = LentObjects, key_version_store=KeyVersions}) ->
+    perform_read_internal({sync,Coordinator},Key,Type,TxId, SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self),
     {noreply,SD0};
 
 handle_call({go_down},_Sender,SD0) ->
     {stop,shutdown,ok,SD0}.
 
 handle_cast({perform_read_cast, Coordinator, Key, Type, TxId},
-	    SD0=#state{snapshot_cache=SnapshotCache,prepared_cache=PreparedCache,self=Self, lent_obj_buff = LentObjects}) ->
-    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, Self),
+	    SD0=#state{snapshot_cache = SnapshotCache, prepared_cache = PreparedCache, self = Self, lent_obj_buff = LentObjects, key_version_store = KeyVersions}) ->
+    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self),
     {noreply,SD0}.
 
 
@@ -184,74 +189,30 @@ handle_cast({perform_read_cast, Coordinator, Key, Type, TxId},
 %% To ensure causality when reading a value of a key recently updated at another node, the client needs to specify the last node's pid
 %% as well as the time of the operation. 
 %% When a read is performed, the buffer containing all borrowed key is verified. If searched key is not inside, lent it to the requesting node and 
-%% add a new entry in the buffer with the borrower's pid and the time of lending for the given key.  However, if the key has been borrowed (i.e. 
+%% add a new entry in the buffer with the version's pid and the time of lending for the given key.  However, if the key has been borrowed (i.e. 
 %% there is an entry in the buffer), aditional verification must be performed. If the pid of the node where the earlier updates took place is not 
 %% listed or the timestamp is bigger (meaning, a mearge and a re-borrowing in the meantime) than the updates can be seen. If not, the fsm sends a 
 %% resends the message to itself in the hope that the updates will have merged. 
 
 
-perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache,  LentObjects, Self) ->
+perform_read_internal(Coordinator, Key, Type, TxId, SnapshotCache, PreparedCache, LentObjects, KeyVersions, Self) ->
     %%looks in logs and in prepared cache for possible candidates. 
     io:format("TX ID: ~p, ~n", [TxId]),
-    case TxId#tx_id.borrower of 
-        any -> 
-            case check_clock(Key,TxId,PreparedCache) of
-            	not_ready ->
-            	    spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, Self);
-            	ready ->
-            	    return(Coordinator,Key,Type,TxId,SnapshotCache)
-            end;
-        _ -> 
-            case ets:lookup(LentObjects, Key) of
-                [] ->
-                    log_divergent_history(Key, TxId, LentObjects),
-                    perform_read_internal(Coordinator, Key, Type, TxId#tx_id{borrower=any}, SnapshotCache, PreparedCache, LentObjects, Self);
-                [{Key, Dictionary}] ->
-                    case dict:is_key(TxId#tx_id.borrower, Dictionary) of
-                        true ->
-                            case dict:fetch(TxId#tx_id.borrower, Dictionary) > TxId#tx_id.snapshot_time of
-                                false ->
-                                    log_divergent_history(Key, TxId, LentObjects),
-                                    perform_read_internal(Coordinator, Key, Type, TxId#tx_id{borrower=any}, SnapshotCache, PreparedCache, LentObjects, Self);
-                                true ->
-                                    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, Self)
-                            end;
-                        false ->
-                            log_divergent_history(Key, TxId, LentObjects),
-                            perform_read_internal(Coordinator, Key, Type, TxId#tx_id{borrower=any}, SnapshotCache, PreparedCache, LentObjects, Self)
-                    end
-            end
-    end.
-
-log_divergent_history(Key, TxId, LentObjects) ->
-    case ets:lookup(LentObjects, Key) of
-        []  ->
-            %% key is not buffered meaning it's the first time in a while since some has borrowed it. 
-            %% add key to buffer and create a new entry in the dictionary.
-            NewDict1 = dict:store(Key, now_microsec(erlang:now()), dict:new()),
-            io:format("the dictionary: ~p ~n", [NewDict1]),
-            ets:insert(LentObjects,{Key, dict:store(TxId#tx_id.borrower, now_microsec(erlang:now()), dict:new())});
-        [{Key, Dictionary }] ->
-            %% key is bufferd, meaning it has ben lent to some other node. 
-            %% add a new entry to the dictionary  with the borrowing node's PID and time 
-            case dict:is_key(Key,Dictionary) of 
-                true ->
-                    ok; %% entry already exists, no need for duplication. 
-                false ->
-                    %% update dictionary 
-                    ets:insert(LentObjects,{Key, dict:store(TxId#tx_id.borrower, now_microsec(erlang:now()), Dictionary)})
-            end 
+    case check_clock(Key,TxId,PreparedCache) of
+    	not_ready ->
+    	    spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self);
+    	ready ->
+    	    return(Coordinator,Key,Type,TxId,SnapshotCache, LentObjects, KeyVersions)
     end.
 
 
-
-spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects,Self) ->
+spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self) ->
     {message_queue_len,Length} = process_info(self(), message_queue_len),
     case Length of
     	0 ->
             %lager:info("Sleeping to wati for read ~w",[Key]),
     	    timer:sleep(?SPIN_WAIT),
-    	    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects,Self);
+    	    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self);
     	_ ->
             %lager:info("Sending myself to read ~w",[Key]),
     	    gen_server:cast({global,Self},{perform_read_cast,Coordinator,Key,Type,TxId})
@@ -292,9 +253,8 @@ check_prepared(Key,TxId,PreparedCache) ->
 
 %% @doc return:
 %%  - Reads and returns the log of specified Key using replication layer.
-return(Coordinator,Key, Type,TxId, SnapshotCache) ->
+return(Coordinator,Key, Type,TxId, SnapshotCache, _LentObjects, _KeyVersions) ->
     %lager:info("Returning for key ~w",[Key]),
-    io:format("txid in return function: ~p, ~n", [TxId]),
     Reply = case ets:lookup(SnapshotCache, Key) of
         [] ->
             {ok, {Type,Type:new()}};
@@ -310,6 +270,8 @@ return(Coordinator,Key, Type,TxId, SnapshotCache) ->
             %lager:info("Trying to reply for key ~w",[Key]),
             gen_fsm:send_event(Sender, Reply)
     end.
+
+
 
 handle_info(_Info, StateData) ->
     {noreply,StateData}.
@@ -327,8 +289,8 @@ terminate(_Reason, _SD) ->
 
 %%%%%%%%%Intenal%%%%%%%%%%%%%%%%%%
 
-now_microsec({MegaSecs, Secs, MicroSecs}) ->
-    (MegaSecs * 1000000 + Secs) * 1000000 + MicroSecs.
+% now_microsec({MegaSecs, Secs, MicroSecs}) ->
+%     (MegaSecs * 1000000 + Secs) * 1000000 + MicroSecs.
 
 find_version([], _SnapshotTime, Type) ->
     %{error, not_found};

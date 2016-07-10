@@ -146,11 +146,11 @@ execute_batch_ops(timeout,
     ProcessOp = fun(Operation, {UpdatedParts, RSet, Buffer}) ->
                     case Operation of
                         
-                        {read, Key, Type, PrevNode} ->
+                        {read, Key, Type} ->
                             Answer = case dict:find(Key, Buffer) of
                                 error ->
                                     Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
-                                    cache_serv:read(hd(Preflist), Key, Type, TxId#tx_id{borrower=PrevNode}); 
+                                    cache_serv:read(hd(Preflist), Key, Type, TxId); 
                                     %?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId);
                                 {ok, SnapshotState} ->
                                     {ok, {Type,SnapshotState}}

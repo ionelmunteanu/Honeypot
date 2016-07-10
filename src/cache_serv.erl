@@ -23,7 +23,6 @@
         max_table_size :: integer(),
         keys_with_hit_count :: term(),
         partition :: term(),
-        keys_per_tx :: term(),
         node :: term()}).
 
 -record (crdt, {
@@ -100,7 +99,6 @@ update(ListOfOps, TxId,OriginalSender) ->
   Answer.
 
 
-
 update_multi([{{Partition, Node}, WriteSet}|Rest], TxId, OriginalSender) ->
     gen_server:call(gen_cache_name(), {update_multi, [{{Partition, Node}, WriteSet}|Rest], TxId, OriginalSender}).
 
@@ -122,13 +120,11 @@ init([]) ->
   %% do i need to generate a table name as well? don't think so...to do: check
   Table = ets:new(gen_table_name(), [set, named_table, {keypos, #crdt.key}]),
   Prepared = ets:new(gen_prepare_name(), [set, named_table]),
-  KeysPerTx = ets:new(keys_per_tx, [set, named_table]),
   {ok, #state{table_name = Table,
         tmr_serv_id = gen_timer_serv_name(),
         backup_file = ?BKUP_FILE,
         max_table_size = ?MAX_TABLE_SIZE,
         keys_with_hit_count = Prepared,
-        keys_per_tx = KeysPerTx,
         node= 1}}.
 
 
@@ -184,7 +180,6 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
       {error, Reason} ->
         io:format("Error in update handler has occured while fetching crdt from Vnode. Reason: ~w~n", [Reason]),
         {Acc, TotalHitCount};
-
       {ok, Object} ->
         UpdatedObject = Object#crdt{  snapshot = UpdateVal(Object, Type, Op, Actor), 
                                       ops = (Object#crdt.ops ++ [{Op, Actor, TxId}])},
@@ -202,7 +197,7 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
 
   {UpdatedKeySet, TotalHitCount } = lists:foldl(UpdateWriteset, {[],0}, ListOfOperations),
   
-  Reply = case UpdatedKeySet of
+    Reply = case UpdatedKeySet of
     [] ->
       {error,'Read servers not ready yet'};
     NotEmpty ->
@@ -231,7 +226,7 @@ handle_cast(Msg, State) ->
 handle_info({lease_expired, Keys}, State=#state{table_name = Table, keys_with_hit_count = Prepared}) ->
   io:format("lease expired on keys: ~p~n ",[Keys]),
   
-  MapCommitTxs = fun(Value , Acc) ->
+  _MapCommitKeys = fun(Value , Acc) ->
     {Transaction, Rest} = Value,
     case dict:is_key(Transaction, Acc) of
         false ->
@@ -241,44 +236,51 @@ handle_info({lease_expired, Keys}, State=#state{table_name = Table, keys_with_hi
     end
   end,
 
-
-  FlatmapOps = fun(Key, Acc) ->
+ 
+  %% get all entries from ets by key from expired set and create one transaction.  
+  FlatmapOps = fun(Key) ->
     case ets:lookup(Table, Key) of
       [] ->
-        Acc; %% crdt not found. maybe deleted by make_room
+        [];
       [Result] ->
         Answ = case length(Result#crdt.ops) > 0 of 
           true ->
-            %this flatmaps the operations/transactions per key. A key may be updated in multipel transactions. 
-            % this must be reflected in the log. 
-            Acc ++ [{Tx, {get_location(Result#crdt.key), {Result#crdt.key, Result#crdt.type, {Op, Actor}}}} || {Op, Actor, Tx} <- Result#crdt.ops];
-          _ -> 
-            Acc
+            [ {Op, Actor} || {Op, Actor, _Tx} <- Result#crdt.ops];
+          false -> 
+            []
         end,
         ets:delete_object(Table, Result), %%what if this fails? 
-        Answ
+        {get_location(Key), [{Result#crdt.key, Result#crdt.type, Answ}]}
     end
   end,
 
-  %make dictionary from list having the transactions as keys and as values list of type [{location,{key,type,{op, actor}}}|_rest]
+  % make dictionary from list having the transactions as keys and as values list of type [{location,{key,type,{op, actor}}}|_rest]
 
-  Fm = lists:foldl(FlatmapOps, [], Keys), 
-  TxDict = lists:foldl(MapCommitTxs, dict:new(), Fm),
-
-  TxHandover = fun(Tx, Ops, Acc) ->
-    ND = lists:foldl(MapCommitTxs, dict:new(), Ops),
-    ets:insert(Prepared, {Tx, ND, ?MAX_RETRIES}),
-    %%TODO replace whit with a pool of workers
-    cache_2pc_sup:start_worker( Tx, ND, self()),
-    %Acc++clocksi_vnode:prepare(ND, Tx)
-    Acc
+  Fm = lists:map(FlatmapOps,  Keys), 
+  TxHandover = fun(WS) ->
+    case WS of 
+      []->
+        ok;
+      _NonNull ->
+        {_, [{Key, _, Ops}]} = WS, 
+        case Ops of 
+          [] ->
+            ok;
+           _ ->
+            Tx = tx_utilities:create_transaction_record(ignore), 
+            RampKeys = lists:delete(Key, Keys),
+            io:format("Keys:~p, Key:~p, RampKeys:~p~n", [Keys, Key, RampKeys]),              
+            ets:insert(Prepared, {Tx#tx_id{ramp=RampKeys}, WS, ?MAX_RETRIES}),
+            %%TODO replace whit a pool of workers
+            cache_2pc_sup:start_worker( {Tx#tx_id{ramp=RampKeys}}, [WS], self())
+          end
+      end
   end,
 
-  dict:fold(TxHandover, [], TxDict), 
-
-  %io:format("overallResult:~p~n",[OverallResult]),
-
+  lists:foreach(TxHandover, Fm),
   {noreply, State};
+
+
 
 handle_info(Msg, State=#state{ keys_with_hit_count = Prepared}) ->
   case Msg of

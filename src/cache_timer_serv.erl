@@ -81,8 +81,11 @@ handle_info({send_lease_expired, [Key, Sender]},  State=#state{graph = Graph}) -
   ListOfKeys = lists:foldl(
     fun(Val,A1) -> 
       case Val of 
-        {tref, TRef} -> timer:cancel(TRef); 
-        {V} -> [V|A1] 
+        {{tref, TRef}} -> 
+          timer:cancel(TRef),
+          A1; 
+        {V} -> 
+          [V|A1] 
       end 
     end, [], ListOfVertices),
   

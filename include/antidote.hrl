@@ -46,10 +46,8 @@
 
 -define(CLOCKSI_TIMEOUT, 1000).
 
-%% node is added to the original tx_id to support honeypot's distributed caching protocol
-%% when set, a request fill be fulfilled function of the the key, timestamp and previous 
-%% borrowing nodes
--record(tx_id, {snapshot_time, server_pid :: pid(), borrower}).
+%% ramp is added to the tx_id record to store writeset keys or bloomfilter 
+-record(tx_id, {snapshot_time, server_pid :: pid(), ramp}).
 -record(clocksi_payload, {key :: key(),
                           type :: type(),
                           op_param :: op(),
@@ -61,6 +59,10 @@
                       vec_snapshot_time, 
                       txn_id :: txid()}).
 
+%% describes every key's stable and last lent version. latest is incremented each time the key is lent
+%% while stable is incremented each time key having last version = stable + 1 returned. used for 
+%% maintaining causality 
+-record(version, {stable, last}).
 %%---------------------------------------------------------------------
 -type key() :: term().
 -type op()  :: {term(), term()}.

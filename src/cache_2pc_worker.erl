@@ -93,13 +93,15 @@ init([TxId, WriteSet, From]) ->
   },
   case dict:size(WriteSet) > 1 of 
     false ->
-      ?CLOCKSI_VNODE:single_commit(dict:to_list(WriteSet), TxId),
-      {ok, single_committing, SD#state{state=committing, num_to_ack=1, tx_id=TxId}};   
+      % [{Node,WriteSet}]
+      ?CLOCKSI_VNODE:single_commit(WriteSet, TxId),  %%writeset should be [{Node, {Key, Type[{Op, Act}...]}}}]
+      {ok, single_committing, SD#state{state=committing, num_to_ack=1, tx_id=TxId}}.  
     true -> 
+      %%this 
       ?CLOCKSI_VNODE:prepare(WriteSet, TxId),
       {ok, receive_prepared, SD#state{num_to_ack=dict:size(WriteSet), state=prepared,
         updated_partitions=WriteSet, tx_id=TxId}}
-  end.
+  %end.
 
 
 %% @doc Contact the leader computed in the prepare state for it to execute the
