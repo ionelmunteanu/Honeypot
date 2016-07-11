@@ -225,59 +225,37 @@ handle_cast(Msg, State) ->
 
 handle_info({lease_expired, Keys}, State=#state{table_name = Table, keys_with_hit_count = Prepared}) ->
   io:format("lease expired on keys: ~p~n ",[Keys]),
-  
-  _MapCommitKeys = fun(Value , Acc) ->
-    {Transaction, Rest} = Value,
-    case dict:is_key(Transaction, Acc) of
-        false ->
-            dict:store(Transaction, [Rest], Acc);
-        true ->
-            dict:append(Transaction, Rest, Acc)
-    end
-  end,
 
- 
   %% get all entries from ets by key from expired set and create one transaction.  
-  FlatmapOps = fun(Key) ->
+  FlatmapOps = fun(Key, Dict) ->
     case ets:lookup(Table, Key) of
       [] ->
-        [];
+        Dict;
       [Result] ->
-        Answ = case length(Result#crdt.ops) > 0 of 
+        Bla = case length(Result#crdt.ops) > 0 of 
           true ->
-            [ {Op, Actor} || {Op, Actor, _Tx} <- Result#crdt.ops];
+             Answ =[ {Op, Actor} || {Op, Actor, _Tx} <- Result#crdt.ops],
+             dict:store(get_location(Key), [{Result#crdt.key, Result#crdt.type, Answ}], Dict);
           false -> 
-            []
+            Dict
         end,
-        ets:delete_object(Table, Result), %%what if this fails? 
-        {get_location(Key), [{Result#crdt.key, Result#crdt.type, Answ}]}
+        ets:delete_object(Table, Result),
+        Bla
     end
   end,
 
-  % make dictionary from list having the transactions as keys and as values list of type [{location,{key,type,{op, actor}}}|_rest]
 
-  Fm = lists:map(FlatmapOps,  Keys), 
-  TxHandover = fun(WS) ->
-    case WS of 
-      []->
-        ok;
-      _NonNull ->
-        {_, [{Key, _, Ops}]} = WS, 
-        case Ops of 
-          [] ->
-            ok;
-           _ ->
-            Tx = tx_utilities:create_transaction_record(ignore), 
-            RampKeys = lists:delete(Key, Keys),
-            io:format("Keys:~p, Key:~p, RampKeys:~p~n", [Keys, Key, RampKeys]),              
-            ets:insert(Prepared, {Tx#tx_id{ramp=RampKeys}, WS, ?MAX_RETRIES}),
-            %%TODO replace whit a pool of workers
-            cache_2pc_sup:start_worker( {Tx#tx_id{ramp=RampKeys}}, [WS], self())
-          end
-      end
-  end,
-
-  lists:foreach(TxHandover, Fm),
+  Fm = lists:foldl(FlatmapOps, dict:new(), Keys), 
+  case dict:size(Fm) > 0  of
+    true ->
+      io:format("the fuck is fm? :~p~n", [Fm]),
+      Tx = tx_utilities:create_transaction_record(ignore),     
+      ets:insert(Prepared, {Tx#tx_id{ramp=Keys}, Fm, ?MAX_RETRIES}),
+      %%TODO replace whit a pool of workers
+      cache_2pc_sup:start_worker( {Tx#tx_id{ramp=Keys}}, Fm, self());
+    false ->
+      ok
+    end,
   {noreply, State};
 
 
