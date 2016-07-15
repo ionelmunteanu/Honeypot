@@ -56,8 +56,7 @@
 		prepared_cache :: cache_id(),
 		self :: atom(),
         pending_requests :: cache_id(),
-        lent_obj_buff, 
-        key_version_store}).
+        ramp_metadata_store}).
 
 %%%===================================================================
 %%% API
@@ -82,7 +81,7 @@ read_data_item({Partition,Node},Key,Type,TxId) ->
 			{perform_read,Key,Type,TxId},infinity)
     catch
         _:Reason ->
-            io:format("Exception caught: ~p~n", [Reason]),
+            io:format("Exception caught in readitem_fsm: ~p~n", [Reason]),
             {error, Reason}
     end.
 
@@ -160,28 +159,25 @@ init([Partition, Id]) ->
     Addr = node(),
     SnapshotCache = clocksi_vnode:get_cache_name(Partition,inmemory_store),
     PreparedCache = clocksi_vnode:get_cache_name(Partition,prepared),
-    LentObjects = clocksi_vnode:get_cache_name(Partition, lent_obj_buff),
-    KeyVersions = clocksi_vnode:get_cache_name(Partition,key_version_store),
-    
+    RampStore = clocksi_vnode:get_cache_name(Partition,ramp_metadata_store),
     Self = generate_server_name(Addr,Partition,Id),
     
     {ok, #state{partition=Partition, id=Id, 
 		snapshot_cache=SnapshotCache,
 		prepared_cache=PreparedCache,self=Self,
-        lent_obj_buff = LentObjects,
-        key_version_store=KeyVersions}}.
+        ramp_metadata_store = RampStore}}.
 
 handle_call({perform_read, Key, Type, TxId},Coordinator,
-	    SD0=#state{snapshot_cache=SnapshotCache,prepared_cache=PreparedCache,self=Self, lent_obj_buff = LentObjects, key_version_store=KeyVersions}) ->
-    perform_read_internal({sync,Coordinator},Key,Type,TxId, SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self),
+	    SD0=#state{snapshot_cache=SnapshotCache,prepared_cache=PreparedCache,self=Self, ramp_metadata_store = RampStore}) ->
+    perform_read_internal({sync,Coordinator},Key,Type,TxId, SnapshotCache,PreparedCache, RampStore,  Self),
     {noreply,SD0};
 
 handle_call({go_down},_Sender,SD0) ->
     {stop,shutdown,ok,SD0}.
 
 handle_cast({perform_read_cast, Coordinator, Key, Type, TxId},
-	    SD0=#state{snapshot_cache = SnapshotCache, prepared_cache = PreparedCache, self = Self, lent_obj_buff = LentObjects, key_version_store = KeyVersions}) ->
-    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self),
+	    SD0=#state{snapshot_cache = SnapshotCache, prepared_cache = PreparedCache, self = Self, ramp_metadata_store = RampStore}) ->
+    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, RampStore,  Self),
     {noreply,SD0}.
 
 
@@ -195,24 +191,24 @@ handle_cast({perform_read_cast, Coordinator, Key, Type, TxId},
 %% resends the message to itself in the hope that the updates will have merged. 
 
 
-perform_read_internal(Coordinator, Key, Type, TxId, SnapshotCache, PreparedCache, LentObjects, KeyVersions, Self) ->
+perform_read_internal(Coordinator, Key, Type, TxId, SnapshotCache, PreparedCache, RampStore, Self) ->
     %%looks in logs and in prepared cache for possible candidates. 
     io:format("TX ID: ~p, ~n", [TxId]),
     case check_clock(Key,TxId,PreparedCache) of
     	not_ready ->
-    	    spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self);
+    	    spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, RampStore, Self);
     	ready ->
-    	    return(Coordinator,Key,Type,TxId,SnapshotCache, LentObjects, KeyVersions)
+    	    return(Coordinator,Key,Type,TxId,SnapshotCache, RampStore)
     end.
 
 
-spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self) ->
+spin_wait(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, RampStore,  Self) ->
     {message_queue_len,Length} = process_info(self(), message_queue_len),
     case Length of
     	0 ->
             %lager:info("Sleeping to wati for read ~w",[Key]),
     	    timer:sleep(?SPIN_WAIT),
-    	    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, LentObjects, KeyVersions, Self);
+    	    perform_read_internal(Coordinator,Key,Type,TxId,SnapshotCache,PreparedCache, RampStore, Self);
     	_ ->
             %lager:info("Sending myself to read ~w",[Key]),
     	    gen_server:cast({global,Self},{perform_read_cast,Coordinator,Key,Type,TxId})
@@ -253,14 +249,14 @@ check_prepared(Key,TxId,PreparedCache) ->
 
 %% @doc return:
 %%  - Reads and returns the log of specified Key using replication layer.
-return(Coordinator,Key, Type,TxId, SnapshotCache, _LentObjects, _KeyVersions) ->
+return(Coordinator,Key, Type,TxId, SnapshotCache, RampStore) ->
     %lager:info("Returning for key ~w",[Key]),
     Reply = case ets:lookup(SnapshotCache, Key) of
         [] ->
-            {ok, {Type,Type:new()}};
+            {ok, {Type,Type:new(),{-1, []}}};
         [{Key, ValueList}] ->
             MyClock = TxId#tx_id.snapshot_time,
-            find_version(ValueList, MyClock, Type)
+            find_version(ValueList, MyClock, Type, RampStore)
     end,
 
     case Coordinator of
@@ -289,16 +285,23 @@ terminate(_Reason, _SD) ->
 
 %%%%%%%%%Intenal%%%%%%%%%%%%%%%%%%
 
-% now_microsec({MegaSecs, Secs, MicroSecs}) ->
-%     (MegaSecs * 1000000 + Secs) * 1000000 + MicroSecs.
+ % now_microsec({MegaSecs, Secs, MicroSecs}) ->
+ %     (MegaSecs * 1000000 + Secs) * 1000000 + MicroSecs.
 
-find_version([], _SnapshotTime, Type) ->
+find_version([], _SnapshotTime, Type, _RampStore) ->
     %{error, not_found};
-    {ok, {Type,Type:new()}};
-find_version([{TS, Value}|Rest], SnapshotTime, Type) ->
+    {ok, {Type,Type:new(),{-1, []}}};
+
+find_version([{TS, Value}|Rest], SnapshotTime, Type, RampStore) ->
     case SnapshotTime >= TS of
         true ->
-            {ok, {Type,Value}};
+          Answ = case ets:lookup(RampStore, SnapshotTime) of 
+            [] ->
+                {-1, []};
+              [{Timestamp, Metadata}] ->
+                {Timestamp, Metadata}
+            end,
+            {ok, {Type,Value,Answ}};
         false ->
-            find_version(Rest, SnapshotTime, Type)
+            find_version(Rest, SnapshotTime, Type, RampStore)
     end.

@@ -28,7 +28,7 @@
 	    get_cache_name/2,
         set_prepared/4,
         async_send_msg/2,
-        update_store/5,
+        update_store/4,
 
         check_prepared/3,
         prepare/2,
@@ -75,7 +75,7 @@
                 if_replicate :: boolean(),
                 quorum :: non_neg_integer(),
                 inmemory_store :: cache_id(),
-                key_version_store,
+                ramp_metadata_store,
                 lent_keys,
                 buffer}).
 
@@ -153,7 +153,7 @@ init([Partition]) ->
     ObjectBuffer = open_table(Partition, returned_buffer),
     
     %%shared with the readitem_fsm process
-    KeyVersions = ets:new(get_cache_name(Partition,key_version_store),
+    RampStore = ets:new(get_cache_name(Partition,ramp_metadata_store),
         [set,public,named_table,?TABLE_CONCURRENCY]),    
 
     %%shared with the readitem_fsm process
@@ -180,7 +180,7 @@ init([Partition]) ->
                 if_certify = IfCertify,
                 if_replicate = IfReplicate,
                 inmemory_store = InMemoryStore,
-                key_version_store = KeyVersions, 
+                ramp_metadata_store = RampStore, 
                 lent_keys=LentObjects,
                 buffer=ObjectBuffer}}.
 
@@ -475,10 +475,12 @@ set_prepared(TxMetadata,[{Key, _Type, _Op} | Rest],TxId,Time) ->
     true = ets:insert(TxMetadata, {Key, {TxId, Time}}),
     set_prepared(TxMetadata,Rest,TxId,Time).
 
-commit(TxId, TxCommitTime, Updates, CommittedTx, State=#state{inmemory_store=InMemoryStore, key_version_store = KeyVersions}) ->
-    case Updates of
+commit(TxId, TxCommitTime, Updates, CommittedTx, State=#state{inmemory_store=InMemoryStore, ramp_metadata_store = RampStore}) -> case Updates of
         [{Key, _Type, _Value} | _Rest] -> 
-            update_store(Updates, TxId, TxCommitTime, InMemoryStore, KeyVersions),
+            {Tx} = TxId,
+            io:format("inserting metadata: ~p~n", [{TxCommitTime, Tx#tx_id.ramp}]),
+            ets:insert(RampStore, {TxCommitTime, Tx#tx_id.ramp}),
+            update_store(Updates, TxId, TxCommitTime, InMemoryStore),
             NewDict = dict:store(Key, TxCommitTime, CommittedTx),
             clean_and_notify(TxId,Updates,State),
             {ok, {committed, NewDict}};
@@ -593,21 +595,22 @@ check_prepared(TxId, TxMetadata, Key) ->
 %%     end.
 
 -spec update_store(KeyValues :: [{key(), atom(), term()}], TxId::txid(),TxCommitTime:: {term(), term()},
-                                InMemoryStore :: cache_id(), KeyVersions :: cache_id()) -> ok.
-update_store([], _TxId, _TxCommitTime, _InMemoryStore, _KeyVersions) ->
+                                InMemoryStore :: cache_id()) -> ok.
+update_store([], _TxId, _TxCommitTime, _InMemoryStore) ->
     ok;
-%update_store([{Key, Type, {Param, Actor}}|Rest], TxId, TxCommitTime, InMemoryStore, KeyVersions) ->
-update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore, KeyVersions) ->
+%update_store([{Key, Type, {Param, Actor}}|Rest], TxId, TxCommitTime, InMemoryStore, RampStore) ->
+update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
     %lager:info("Store ~w",[InMemoryStore]),
+
     case ets:lookup(InMemoryStore, Key) of
         [] ->
      %       lager:info("Wrote ~w to key ~w",[Value, Key]),
             Init = Type:new(),
             {ok, NewSnapshot} = case Ops of
-                {Param, Actor} ->                       %% one simple operation for specific key
+                {Param, Actor} ->
                     Type:update(Param, Actor, Init); 
                     %lager:info("Updateing store for key ~w, value ~w firstly", [Key, Type:value(NewSnapshot)]),  
-                [_H | _T] ->                            %% list of operations for the same key
+                [_H | _T] -> 
                     Answ = lists:foldl(fun({Param, Actor}, Cr) -> 
                         {ok, New} = Type:update(Param, Actor, Cr), 
                         New 
@@ -620,21 +623,20 @@ update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore, KeyVers
             {RemainList, _} = lists:split(min(20,length(ValueList)), ValueList),
             [{_CommitTime, First}|_] = RemainList,        
             {ok, NewSnapshot} = case Ops of
-                {Param, Actor} ->                       %% one simple operation for specific key
+                {Param, Actor} ->
                     Type:update(Param, Actor, First); 
                     %lager:info("Updateing store for key ~w, value ~w firstly", [Key, Type:value(NewSnapshot)]),  
-                [_H | _T]  ->                           %% list of operations for the same key
+                [_H | _T]  ->
                     Answ = lists:foldl(fun({Param, Actor}, Cr) -> 
                         {ok, New} = Type:update(Param, Actor, Cr), 
                         New 
                     end, First, Ops),
                     {ok, Answ}
-            end, %%case 
+            end,
             %lager:info("Updateing store for key ~w, value ~w", [Key, Type:value(NewSnapshot)]),
-            io:format("nEW value IS : ~p, ~n", [riak_dt_gcounter:value(NewSnapshot)]),
             true = ets:insert(InMemoryStore, {Key, [{TxCommitTime, NewSnapshot}|RemainList]})            
     end,
-    update_store(Rest, TxId, TxCommitTime, InMemoryStore, KeyVersions), 
+    update_store(Rest, TxId, TxCommitTime, InMemoryStore), 
     ok.
 
 %write_set_to_logrecord(TxId, WriteSet) ->

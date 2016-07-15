@@ -32,8 +32,8 @@
         last_accessed :: term(),
         time_created :: term(),
         type :: type(),
-        stable_version :: term(),
-        borrow_time :: term(),
+        timestamp :: term(),
+        metadata :: term(),
         ops :: [term()]}).
 
 %% API
@@ -248,7 +248,6 @@ handle_info({lease_expired, Keys}, State=#state{table_name = Table, keys_with_hi
   Fm = lists:foldl(FlatmapOps, dict:new(), Keys), 
   case dict:size(Fm) > 0  of
     true ->
-      io:format("the fuck is fm? :~p~n", [Fm]),
       Tx = tx_utilities:create_transaction_record(ignore),     
       ets:insert(Prepared, {Tx#tx_id{ramp=Keys}, Fm, ?MAX_RETRIES}),
       %%TODO replace whit a pool of workers
@@ -314,9 +313,9 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
   case ets:lookup(Table, Key) of
     [] ->
       case clocksi_vnode:read_data_item({Partition, Node}, Key, Type, TxId) of
-        {ok, {_CrdtType, CrdtSnapshot}} -> 
+        {ok, {_CrdtType, CrdtSnapshot,{TimeStamp, Metadata}}} -> 
           Object = #crdt{ key =  Key, snapshot = CrdtSnapshot, hit_count  =  0, last_accessed = 0,
-                          time_created  = 0, type = Type, stable_version = -1, borrow_time = -1, ops = []}, 
+                          time_created  = 0, type = Type, timestamp = TimeStamp, metadata = Metadata, ops = []}, 
           %% start counter only if element has was not previously cached.
           %% not a good ideea since it might trigger a counter for a key linked to a previous cachef one by a transaction id
           %cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
