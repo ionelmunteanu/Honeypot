@@ -81,7 +81,10 @@ stop() ->
 %%  {ok, {Type, Value}}
 
 read({Partition, Node}, Key, Type, TxId) ->
-  gen_server:call( cache_serv, {read, {{Partition, Node}, Key, Type, TxId}}).
+  gen_server:call( cache_serv, {read, {{Partition, Node}, Key, Type, TxId}});
+
+make_view(KeyTypeList, TxId) ->
+  gen_server:call( cache_serv, {make_view, {KeyTypeList, TxId}}).
 
 
 %% Calls a callback responsable with updating items in the cache, similar to 
@@ -159,6 +162,28 @@ handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{ta
       {ok,{Type, Object#crdt.snapshot}}
   end,
   {reply, Reply, State};
+
+handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = Table}) ->
+
+  LatestTime = lists:foldl(fun({K, T}, Acc) ->
+                case ets:lookup(Table, K) of
+                  [] -> Acc; %if no result just return the accumulator
+                  [Result] -> ?IF(Result#crdt.timestamp > Acc,Result#crdt.timestamp, ACC)
+                  end, TxId#tx_id.snapshot_time, KeyTypeList)
+
+  Reply = case fetch_cachable_crdt({Partition, Node},Key, Type,TxId#tx_id{snapshot_time = LatestTime}, Table) of
+    {error, Reason} ->
+      io:format("Error has occured while fetching crdt from Vnode.~nReason: ~w~n", [Reason]),
+      {error, Reason};
+    {ok,Object} ->
+      ets:insert(Table, Object),
+      trigger_counter([Object#crdt.key], TxId, Object#crdt.hit_count),
+      {ok,{Type, Object#crdt.snapshot}}
+  end,
+  {reply, Reply, State};
+
+
+
 
 
 %% Verifies if object is already in cache. If not, fetch if from its vnode, 

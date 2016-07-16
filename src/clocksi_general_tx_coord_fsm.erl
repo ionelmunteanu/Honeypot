@@ -141,58 +141,34 @@ execute_batch_ops(timeout,
                     operations=Operations
 		      }) ->
     TxId = tx_utilities:create_transaction_record(CausalClock),
-    io:format("process name is: ~p ~n", [TxId] ),
     [CurrentOps|_RestOps] = Operations, 
     ProcessOp = fun(Operation, {UpdatedParts, RSet, Buffer}) ->
-                    case Operation of
-                        
-                        {read, Key, Type} ->
-                            Answer = case dict:find(Key, Buffer) of
-                                error ->
-                                    Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
-                                    cache_serv:read(hd(Preflist), Key, Type, TxId); 
-                                    %?CLOCKSI_VNODE:read_data_item(IndexNode, Key, Type, TxId);
-                                {ok, SnapshotState} ->
-                                    {ok, {Type,SnapshotState}}
-                            end,
-
-                            case Answer of 
-                                {ok, {Type, Snapshot}}-> 
-                                     {UpdatedParts, [Type:value(Snapshot)|RSet], dict:store(Key, Snapshot, Buffer)};
-                                {error, Reason} ->
-                                    io:format("Read operation failed due to: ~p, ~n",[Reason] ),
-                                    {UpdatedParts, RSet, Buffer}
-                            end;
-                            %lager:info("New read set is ~w",[RSet]),
-                           
-                        
-                        {update, Key, Type, Op} ->
-                            Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
-                            IndexNode = hd(Preflist),
-                            UpdatedParts1 = case dict:is_key(IndexNode, UpdatedParts) of
-                                                false ->
-                                                    dict:store(IndexNode, [{Key, Type, Op}], UpdatedParts);
-                                                true ->
-                                                    dict:append(IndexNode, {Key, Type, Op}, UpdatedParts)
-                                            end,
-                            Buffer1 = case dict:find(Key, Buffer) of
-                                        error ->
-                                            Init = Type:new(),
-                                            {Param, Actor} = Op,
-                                            {ok, NewSnapshot} = Type:update(Param, Actor, Init),
-                                            dict:store(Key, NewSnapshot, Buffer);
-                                        {ok, Snapshot} ->
-                                            {Param, Actor} = Op,
-                                            {ok, NewSnapshot} = Type:update(Param, Actor, Snapshot),
-                                            dict:store(Key, NewSnapshot, Buffer)
-                                        end,
-                            {UpdatedParts1, RSet, Buffer1}
-                    end
-                end,
+        case Operation of
+            
+            {read, Key, Type} ->
+                {UpdatedParts1, [{Key, Type}|RSet]}
+                    % {ok, {Type, Snapshot}}-> %returned by cache_serv:read(hd(Preflist), Key, Type, TxId); 
+                    %      {UpdatedParts, [Type:value(Snapshot)|RSet], dict:store(Key, Snapshot, Buffer)};
+            {update, Key, Type, Op} ->
+                Preflist = ?LOG_UTIL:get_preflist_from_key(Key),
+                IndexNode = hd(Preflist),
+                UpdatedParts1 = case dict:is_key(IndexNode, UpdatedParts) of
+                                    false ->
+                                        dict:store(IndexNode, [{Key, Type, Op}], UpdatedParts);
+                                    true ->
+                                        dict:append(IndexNode, {Key, Type, Op}, UpdatedParts)
+                                end,
+                {UpdatedParts1, RSet}
+        end
+    end,
 
 
+    %%ReadSet1 is a list of values [0,1,2,3,]
     {WriteSet1, ReadSet1, _} = lists:foldl(ProcessOp, {dict:new(), [], dict:new()}, CurrentOps),
     %lager:info("Operations are ~w, WriteSet is ~w, ReadSet is ~w",[CurrentOps, WriteSet1, ReadSet1]),
+    
+    cache_serv:read(Rset, TxId), %get keys consistently 
+
     case dict:size(WriteSet1) of
         0->
             reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, 
@@ -200,14 +176,10 @@ execute_batch_ops(timeout,
         1->
             UpdatedPart = dict:to_list(WriteSet1),
             Res = cache_serv:update(UpdatedPart,TxId, self()),
-            io:format("update command has returned with : ~p, ~n", [Res]),
             reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, commit_time=clocksi_vnode:now_microsec(now())});
-            % ?CLOCKSI_VNODE:single_commit(UpdatedPart, TxId),
-            % {next_state, single_committing, SD#state{state=committing, num_to_ack=1, read_set=ReadSet1, tx_id=TxId}}
             
         _N->
             Res = cache_serv:update(dict:to_list(WriteSet1),TxId, self()),
-            io:format("update command has returned with : ~p, ~n", [Res]),
             reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, commit_time=clocksi_vnode:now_microsec(now())})
     end.
 
