@@ -142,11 +142,11 @@ execute_batch_ops(timeout,
 		      }) ->
     TxId = tx_utilities:create_transaction_record(CausalClock),
     [CurrentOps|_RestOps] = Operations, 
-    ProcessOp = fun(Operation, {UpdatedParts, RSet, Buffer}) ->
-        case Operation of
-            
+    
+    ProcessOp = fun(Operation, {UpdatedParts, RSet}) ->
+        case Operation of  
             {read, Key, Type} ->
-                {UpdatedParts1, [{Key, Type}|RSet]}
+                {UpdatedParts, [{Key, Type}|RSet]};
                     % {ok, {Type, Snapshot}}-> %returned by cache_serv:read(hd(Preflist), Key, Type, TxId); 
                     %      {UpdatedParts, [Type:value(Snapshot)|RSet], dict:store(Key, Snapshot, Buffer)};
             {update, Key, Type, Op} ->
@@ -162,25 +162,22 @@ execute_batch_ops(timeout,
         end
     end,
 
-
-    %%ReadSet1 is a list of values [0,1,2,3,]
-    {WriteSet1, ReadSet1, _} = lists:foldl(ProcessOp, {dict:new(), [], dict:new()}, CurrentOps),
-    %lager:info("Operations are ~w, WriteSet is ~w, ReadSet is ~w",[CurrentOps, WriteSet1, ReadSet1]),
     
-    cache_serv:read(Rset, TxId), %get keys consistently 
+    %%ReadSet1 is a list of values [0,1,2,3,]
+    {WriteSet1, ReadSet1} = lists:foldl(ProcessOp, {dict:new(), []}, CurrentOps),
+    %lager:info("Operations are ~w, WriteSet is ~w, ReadSet is ~w",[CurrentOps, WriteSet1, ReadSet1]),
+    io:format("opeations: ~p ~n", [WriteSet1]),
+    %%cache_serv:read(ReadSet1, TxId), %get keys consistently 
 
-    case dict:size(WriteSet1) of
-        0->
-            reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, 
-                commit_time=clocksi_vnode:now_microsec(now())});
-        1->
-            UpdatedPart = dict:to_list(WriteSet1),
-            Res = cache_serv:update(UpdatedPart,TxId, self()),
-            reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, commit_time=clocksi_vnode:now_microsec(now())});
-            
-        _N->
-            Res = cache_serv:update(dict:to_list(WriteSet1),TxId, self()),
-            reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=ReadSet1, commit_time=clocksi_vnode:now_microsec(now())})
+cache_serv:update(dict:to_list(WriteSet1), TxId, self()),
+reply_to_client(SD#state{state=committed, tx_id=TxId, read_set=fetch_data(ReadSet1, TxId), commit_time=clocksi_vnode:now_microsec(now())}).
+
+fetch_data(ReadSet, TxId) ->
+    case ReadSet of
+        [] -> [empty];
+        _ -> FromRs = cache_serv:read(ReadSet, TxId), 
+            io:format("result: ~p~n", [FromRs]),
+            FromRs
     end.
 
 %% @doc in this state, the fsm waits for prepare_time from each updated

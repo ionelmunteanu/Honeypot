@@ -54,15 +54,17 @@ init([]) ->
 
 %% ================================================================
 
-handle_call({start_counter,_TxId, Keys, Lease, HitCount, Sender}, _From, State=#state{graph = Graph}) ->
+handle_call({start_counter, _TxId, Keys, Lease, HitCount, Sender}, _From, State=#state{graph = Graph}) ->
   %%Reply = case  timer:send_after(Lease, Sender, {lease_expired, Keys, [time_now()]}) of
+  io:format("list sent to these fuckers:~p~n ", [Keys]),
   insert_dependencies(Keys, Graph),
   io:format("connected components: ~p, ~n ", [digraph_utils:strong_components(Graph)]), 
   Reply = case HitCount > 0 of
     false ->
       [Key| _ ] = Keys, 
-      io:format("activating trigger for ~p ~n ",[Key]),
-      {ok, TRef} = timer:send_after(Lease, self(), {send_lease_expired, [Key, Sender]}),
+      {ok, TRef} = timer:send_after(Lease, self(), {send_lease_expired, {Key, Sender}}),
+      io:format("activating trigger for ~p ~n ",[[Key, {tref, TRef}]]),
+      %%link a TRef to these keys 
       insert_dependencies([Key, {tref, TRef}], Graph);
     true ->
       ok
@@ -75,7 +77,7 @@ handle_call({cancel_timer, TRef}, _From, State) ->
 
 %% ================================================================
 
-handle_info({send_lease_expired, [Key, Sender]},  State=#state{graph = Graph}) ->
+handle_info({send_lease_expired, {Key, Sender}},  State=#state{graph = Graph}) ->
   ListOfVertices = digraph_utils:reaching([{Key}], Graph),
 
   ListOfKeys = lists:foldl(

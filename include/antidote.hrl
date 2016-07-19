@@ -47,7 +47,7 @@
 -define(CLOCKSI_TIMEOUT, 1000).
 
 %% ramp is added to the tx_id record to store writeset keys or bloomfilter 
--record(tx_id, {snapshot_time, server_pid :: pid(), ramp}).
+-record(tx_id, {snapshot_time, server_pid :: pid()}).
 -record(clocksi_payload, {key :: key(),
                           type :: type(),
                           op_param :: op(),

@@ -75,8 +75,6 @@
                 if_replicate :: boolean(),
                 quorum :: non_neg_integer(),
                 inmemory_store :: cache_id(),
-                ramp_metadata_store,
-                lent_keys,
                 buffer}).
 
 %%%===================================================================
@@ -150,16 +148,7 @@ init([Partition]) ->
     CommittedTx = dict:new(),
     %%true = ets:insert(TxMetadata, {committed_tx, dict:new()}),
     InMemoryStore = open_table(Partition, inmemory_store),
-    ObjectBuffer = open_table(Partition, returned_buffer),
-    
-    %%shared with the readitem_fsm process
-    RampStore = ets:new(get_cache_name(Partition,ramp_metadata_store),
-        [set,public,named_table,?TABLE_CONCURRENCY]),    
-
-    %%shared with the readitem_fsm process
-    LentObjects = ets:new(get_cache_name(Partition,lent_obj_buff),
-        [set,public,named_table,?TABLE_CONCURRENCY]),
-    
+ 
     clocksi_readitem_fsm:start_read_servers(Partition),
     %%IfCertify = antidote_config:get(do_cert),
     IfCertify = false,
@@ -179,10 +168,7 @@ init([Partition]) ->
                 quorum = Quorum,
                 if_certify = IfCertify,
                 if_replicate = IfReplicate,
-                inmemory_store = InMemoryStore,
-                ramp_metadata_store = RampStore, 
-                lent_keys=LentObjects,
-                buffer=ObjectBuffer}}.
+                inmemory_store = InMemoryStore}}.
 
 
 check_tables_ready() ->
@@ -475,11 +461,8 @@ set_prepared(TxMetadata,[{Key, _Type, _Op} | Rest],TxId,Time) ->
     true = ets:insert(TxMetadata, {Key, {TxId, Time}}),
     set_prepared(TxMetadata,Rest,TxId,Time).
 
-commit(TxId, TxCommitTime, Updates, CommittedTx, State=#state{inmemory_store=InMemoryStore, ramp_metadata_store = RampStore}) -> case Updates of
-        [{Key, _Type, _Value} | _Rest] -> 
-            {Tx} = TxId,
-            io:format("inserting metadata: ~p~n", [{TxCommitTime, Tx#tx_id.ramp}]),
-            ets:insert(RampStore, {TxCommitTime, Tx#tx_id.ramp}),
+commit(TxId, TxCommitTime, Updates, CommittedTx, State=#state{inmemory_store=InMemoryStore}) -> case Updates of
+        [{Key, _Type, _Value}    | _Rest] -> 
             update_store(Updates, TxId, TxCommitTime, InMemoryStore),
             NewDict = dict:store(Key, TxCommitTime, CommittedTx),
             clean_and_notify(TxId,Updates,State),
