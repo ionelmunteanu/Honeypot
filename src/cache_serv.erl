@@ -6,7 +6,7 @@
 -define(BKUP_FILE, "cache_restore_file").
 -define(MAX_TABLE_SIZE, 10000).
 -define(MAX_INT, 65535).
--define(LEASE, 5000).
+-define(LEASE, 35000).
 -define(MAX_RETRIES, 5).
 
 -define(IF(Cond,Then,Else), (case (Cond) of true -> (Then); false -> (Else) end)).
@@ -280,9 +280,9 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
     %{Partition, Node} = hd(log_utilities:get_preflist_from_key(Key)),
     
     Object = case ets:lookup(Table, Key) of 
-      [] -> #crdt{ key =  Key, snapshot = Type:new(), hit_count  =  0, last_accessed = 0,
+      [] -> #crdt{ key =  Key, snapshot = Type:new(), hit_count = 0, last_accessed = 0,
                           time_created = 0, type = Type, timestamp = 0, ops = []};
-      [Obj] -> Obj
+      [Obj] -> Obj#crdt{hit_count = Obj#crdt.hit_count+1, last_accessed = time_now()}
     end,
     UpdatedObject = Object#crdt{snapshot = UpdateVal(Object, Type, Op, Actor), 
                                     ops = (Object#crdt.ops ++ [{Op, Actor, TxId}])},
@@ -432,7 +432,6 @@ get_location(Key) -> hd(log_utilities:get_preflist_from_key(Key)).
 fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
   case ets:lookup(Table, Key) of
     [] ->
-      io:format("Key: ~p not found~n",[Key]), 
       case clocksi_vnode:read_data_item({Partition, Node}, Key, Type, TxId) of
         {ok, {_CrdtType, CrdtSnapshot, TS}} -> 
           Object = #crdt{ key =  Key, snapshot = CrdtSnapshot, hit_count  =  0, last_accessed = 0,
