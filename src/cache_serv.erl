@@ -27,13 +27,15 @@
         node :: term()}).
 
 -record (crdt, {
-        key :: term(),
+          {
+            key :: term(),
+            timestamp :: term()
+          },
         snapshot :: term()|[term()],
         hit_count :: integer(),
         last_accessed :: term(),
         time_created :: term(),
         type :: type(),
-        timestamp :: term(),
         metadata :: term(),
         ops :: [term()]}).
 
@@ -44,6 +46,7 @@
 
 %% Server CallBacks
 -export([
+    evict/0,
     handle_call/3, 
     handle_cast/2,
     handle_info/2,
@@ -71,6 +74,10 @@ start_link() ->
 
 stop() ->
     gen_server:cast(?MODULE, stop).
+
+
+evict() ->
+  gen_server:call(gen_cache_name(), evict);
 
 %% Calls a read callback which returns the crdt with key Key. If the data item 
 %% is not already cached it will be borrowed from owner.
@@ -167,6 +174,10 @@ handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{ta
   end,
   {reply, Reply, State};
 
+
+handle_call(evict, _From, State=#state(table=Table)) ->
+  evict(Table),
+  {noreply, State};
 
 
 %%
