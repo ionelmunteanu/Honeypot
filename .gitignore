@@ -16,3 +16,4 @@ doc/
 log/
 tags
 rel/vars/*.config
+all.sh*
