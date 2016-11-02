@@ -4,7 +4,7 @@
 
 -define(CACHE, crdt_cache).
 -define(BKUP_FILE, "cache_restore_file").
--define(MAX_TABLE_SIZE, 10000).
+-define(MAX_TABLE_SIZE, 200).
 -define(MAX_INT, 65535).
 -define(LEASE, 35000).
 -define(MAX_RETRIES, 5).
@@ -25,12 +25,15 @@
         partition :: term(),
         old_versions :: term(),
         node :: term()}).
-
--record (crdt, {
-          {
-            key :: term(),
-            timestamp :: term()
-          },
+%% Honeypot specific crdt record used to wrap a CRDT information
+%%  key - name of the crdt
+%%  timestamp - the version (the crdt's commit ts)
+%%  snapshot  - data
+%%  ops       - list of operations performed on the key since it has been cached
+%%  type      - crdt's type. 
+-record (crdt,{
+        key :: term(),
+        timestamp :: term(),
         snapshot :: term()|[term()],
         hit_count :: integer(),
         last_accessed :: term(),
@@ -46,15 +49,14 @@
 
 %% Server CallBacks
 -export([
-    evict/0,
     handle_call/3, 
+    evict/0,
     handle_cast/2,
     handle_info/2,
     code_change/3,
     terminate/2]).
 
 -export([
-    %read/4,
     read/2,
     update/3,
     update_multi/3, 
@@ -77,7 +79,7 @@ stop() ->
 
 
 evict() ->
-  gen_server:call(gen_cache_name(), evict);
+  gen_server:call(gen_cache_name(), evict).
 
 %% Calls a read callback which returns the crdt with key Key. If the data item 
 %% is not already cached it will be borrowed from owner.
@@ -133,7 +135,10 @@ init([]) ->
   %% do i need to generate a table name as well? don't think so...to do: check
   Table = ets:new(gen_table_name(), [set, named_table, {keypos, #crdt.key}]),
   Prepared = ets:new(gen_prepare_name(), [set, named_table]),
-  OldVersions = ets:new(old_versions , [set, named_table]),
+
+  %% keep older versions of the keys ... just in case 
+  %% delete this 
+  OldVersions = ets:new(old_versions , [set, named_table]),  
   {ok, #state{table_name = Table,
         tmr_serv_id = gen_timer_serv_name(),
         max_table_size = ?MAX_TABLE_SIZE,
@@ -175,7 +180,7 @@ handle_call({read, {{Partition, Node}, Key, Type, TxId}}, _From, State=#state{ta
   {reply, Reply, State};
 
 
-handle_call(evict, _From, State=#state(table=Table)) ->
+handle_call(evict, _From, State=#state{table_name = Table}) ->
   evict(Table),
   {noreply, State};
 
@@ -185,7 +190,7 @@ handle_call(evict, _From, State=#state(table=Table)) ->
 %%
 
 handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = Table, old_versions = OldVersions}) ->
-
+  %% todo put lock in case of lease expiration during TX
   %% timestamp of -1 symbolies cache miss. 
   OrderedByTS = lists:foldl(fun({K, Type}, OrdDict) ->
                 case ets:lookup(Table, K) of
@@ -201,9 +206,15 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
                     end
                 end 
               end,orddict:new(), KeyTypeList),
+
   Versions = orddict:fetch_keys(OrderedByTS),
+  
+
+  io:format("versions: ~p~n", [Versions]),
+
   Reply = case Versions of
     [-1] -> 
+      io:format("version is -1~n"),
       {ObjectList, TsMax} = lists:foldl(fun({Key, Type}, {AccL, AccTs}) -> 
                                           case  fetch_cachable_crdt(get_location(Key),Key, Type,TxId, Table) of
                                             {ok, Object} -> 
@@ -215,59 +226,72 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
                                         end,{[], -1}, KeyTypeList),
 
       {KeyVersionList, 0} = lists:foldl(fun(Obj, {AccL, AccCount}) -> 
-                                          ets:insert(Table, Obj#crdt{timestamp = TsMax}),                     % store with highest timestamp of readset
+                                          ets:insert(Table, Obj#crdt{timestamp = TsMax}),                     % store in ets with highest timestamp of readset
                                           {AccL ++ [{Obj#crdt.key, TsMax}], AccCount + Obj#crdt.hit_count}    % send {Key, Version} to timser server with the latest version
                                         end, {[],0}, ObjectList),
       case KeyVersionList of
         [] ->
           io:format("could not get any key ~n");
          _ ->   
+          %% todo wtf am i doing here? 
           cache_timer_serv:start_counter(KeyVersionList, TxId#tx_id{snapshot_time=TsMax}, 0, ?LEASE, self())
         end,
       ObjectList;
+
     [_Version] ->
+      io:format("version is the same so we don't care~n"),
       %% all keys already stored udner the same version already
       lists:map(fun({Key, Type}) -> 
                   {ok,Object} = fetch_cachable_crdt(get_location(Key),Key, Type,TxId, Table),
                   Object
-                end, KeyTypeList); 
+                end, KeyTypeList);
+      %% cache_timer_serv:start_counter(KeyVersionList, TxId#tx_id{snapshot_time=TsMax}, 10, ?LEASE, self()); %% todo add start_counter to link them to the same component. since there version is not -1 that mans they have been cached beforehand
+                                   %% thus having no need for a timmer
+
 
     [_H|_T] ->
       %% Tail Different versions, import new version H (the greatest) and change each tx to that. Up to this point 
       %% [ {TS, [{K1, T1}, {K2. T2} ...]} | Tail ]
+      io:format("version do not match. ~n"),
       [{TxMax, _} | Tail ] = lists:reverse(orddict:to_list(OrderedByTS)),      % order decresengly by key version
-      ObjectList =                                                             % list of updates objects    
-        lists:foldl(fun({Ts, KTList}, AccList) ->                              % map for every version
-                    AccList ++ lists:map(fun({Key, Type}) ->                   % map for every {Key,Type} of a version
-                                %% get old version 
-                                {ok,Object} = fetch_cachable_crdt(get_location(Key),Key, Type,TxId#tx_id{snapshot_time = TxMax}, Table),
-                                Object1 = Object#crdt{timestamp = TxMax}, 
-                                case Ts > -1 of 
-                                  true->                                                            %% older version of the object is precached. all the operations need to be updated
-                                    OldObject = ets:lookup(Table, Key),     
-                                    NewObj = lists:foldl(fun({Op, Actor, _Tx}, ObjAcc) -> 
-                                                            {ok, Result} = Type:update(Op, Actor, ObjAcc#crdt.snapshot),
-                                                            Result
-                                                          end, Object1, OldObject#crdt.ops),
-                                    %% side effects %%
-                                    ets:delete(Table, Key), 
-                                    ets:insert(Table, NewObj),
-                                    ets:insert(OldVersions, {{Key, OldObject#crdt.timestamp}, OldObject});
-                                   false -> ok                                                       %% no older version cached. no need to do anything else
-                                end
-                              end, KTList)                                                           %% every {Key, Type} inside a version 
-                  end,[], Tail),                                                                     %% every specific version
-      {KeyVersionList, Hitcount} = lists:foldl(fun(Obj, {AccL, AccCount}) -> 
-                                                {AccL ++ [{Obj#crdt.key, TxMax}], AccCount + Obj#crdt.hit_count} 
-                                              end, {[],0},ObjectList), 
-      case KeyVersionList of
-        [] ->
-          io:format("could not get any key ~n");
-         _ ->   
-          cache_timer_serv:start_counter(KeyVersionList, TxId#tx_id{snapshot_time=TxMax}, Hitcount, ?LEASE, self())
-        end,
+                                                                               % list of updates objects    
+      ObjectList =  
+      lists:foldl(fun({Ts, KTList}, AccList) ->                              % map for every version
+        AccList ++ lists:map(fun({Key, Type}) ->                   % map for every {Key,Type} of a version
+          %% get old version 
+          {ok,Object} = fetch_cachable_crdt(get_location(Key),Key, Type,TxId#tx_id{snapshot_time = TxMax}, Table),
+          Object1 = Object#crdt{timestamp = TxMax}, 
+          case Ts > -1 of 
+            true->                                                            %% older version of the object is precached. all the operations need to be updated
+              OldObject = ets:lookup(Table, Key),     
+              NewObj = lists:foldl(fun({Op, Actor, _Tx}, ObjAcc) ->           %% merge existing ops to the newly fetchded object todo update hitcount? => not for the new object
+                {ok, Result} = Type:update(Op, Actor, ObjAcc#crdt.snapshot),
+                io:format("result of type update:~p~n ", [Result]),
+                Result
+              end, Object1, OldObject#crdt.ops),
+              %% side effects %%
+              ets:delete(Table, Key), 
+              ets:insert(Table, NewObj),
+              ets:insert(OldVersions, {{Key, OldObject#crdt.timestamp}, OldObject}),
+              NewObj;
+            false -> Object                                                       %% no older version cached. no need to do anything else
+          end  
+        end, KTList)                                                           %% every {Key, Type} inside a version 
+      end,[], Tail),     
+                                                                                 %% every specific version
+      
+      case lists:any( fun(E) -> E=:=-1 end, Versions) of 
+        true -> 
+           cache_timer_serv:start_counter(lists:map(
+            fun({Key, _Type}) -> 
+              Key 
+            end, KeyTypeList), TxId#tx_id{snapshot_time=TxMax}, 0, ?LEASE, self());
+        _ -> key
+      end,
       ObjectList
     end,
+
+
   Repl1 = lists:map(fun(Obj) -> Type = Obj#crdt.type, {Obj#crdt.key, Type:value(Obj#crdt.snapshot)} end, Reply),
   {reply, Repl1, State};
 
@@ -281,29 +305,37 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
 %% TO DO : case of abort! 
 %%handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, prepared = Prepared}) ->
 handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit}) ->
+  
   UpdateVal = fun(FObject, FType, FOp, FActor) ->  
-                {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
-                Result
-              end,
+      {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
+      Result
+  end,
 
   UpdateItemFun = fun(UpdateOp, {Acc, TotalHitCount, MaxTx}) ->
-    {Key, Type, {Op, Actor}} = UpdateOp,
-    %{Partition, Node} = hd(log_utilities:get_preflist_from_key(Key)),
-    
-    Object = case ets:lookup(Table, Key) of 
-      [] -> #crdt{ key =  Key, snapshot = Type:new(), hit_count = 0, last_accessed = 0,
-                          time_created = 0, type = Type, timestamp = 0, ops = []};
-      [Obj] -> Obj#crdt{hit_count = Obj#crdt.hit_count+1, last_accessed = time_now()}
-    end,
-    UpdatedObject = Object#crdt{snapshot = UpdateVal(Object, Type, Op, Actor), 
-                                    ops = (Object#crdt.ops ++ [{Op, Actor, TxId}])},
-    make_room(Table, ?MAX_TABLE_SIZE, UpdatedObject),
-    ets:insert(Table, UpdatedObject),
-    {
-      ?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]),                                 %% accumulate keys
-      TotalHitCount + Object#crdt.hit_count,                                          %% accumulate total hit_count
-      ?IF(UpdatedObject#crdt.timestamp > MaxTx, UpdatedObject#crdt.timestamp, MaxTx)  %% accumulate max timestamp
-    }
+      {Key, Type, {Op, Actor}} = UpdateOp,
+      %{Partition, Node} = hd(log_utilities:get_preflist_from_key(Key)),
+      %% bug: this stores the operation only if the key is not fetched before hand.
+      %% a subsequent read will show only if this hasn't been yet fetched for
+      %% todo add flag for this situation. a read will check if the flag is true(has been fetched from the owner) and if not fetches and merges 
+      %% TODO: check to see if timer is started (timmer should be started for this type of operation)
+      Object = case ets:lookup(Table, Key) of 
+        [] -> #crdt{ key =  Key, snapshot = Type:new(), hit_count = 0, last_accessed = 0,
+                            time_created = 0, type = Type, timestamp = 0, ops = []};
+        [Obj] -> Obj#crdt{hit_count = Obj#crdt.hit_count+1, last_accessed = time_now()}
+      end,
+
+      UpdatedObject = Object#crdt {
+        snapshot = UpdateVal(Object, Type, Op, Actor), 
+        ops = (Object#crdt.ops ++ [{Op, Actor, TxId}])
+      },
+      
+      make_room(Table, ?MAX_TABLE_SIZE, UpdatedObject),
+      
+      ets:insert(Table, UpdatedObject), {
+        ?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]),                                 %% accumulate keys
+        TotalHitCount + Object#crdt.hit_count,                                          %% accumulate total hit_count
+        ?IF(UpdatedObject#crdt.timestamp > MaxTx, UpdatedObject#crdt.timestamp, MaxTx)  %% accumulate max timestamp
+      }
   end, %UpdateItemFun
 
   UpdateWriteset = fun({_,WSs}, {Ks, Hc, Mt}) ->
