@@ -209,6 +209,7 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
 
   Versions = orddict:fetch_keys(OrderedByTS),
   
+  io:format("ordered by my ass: ~p~n",[OrderedByTS]),
 
   io:format("versions: ~p~n", [Versions]),
 
@@ -238,15 +239,14 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
         end,
       ObjectList;
 
-    [_Version] ->
+    [Version] when Version > -1 ->
       io:format("version is the same so we don't care~n"),
       %% all keys already stored udner the same version already
       lists:map(fun({Key, Type}) -> 
                   {ok,Object} = fetch_cachable_crdt(get_location(Key),Key, Type,TxId, Table),
                   Object
                 end, KeyTypeList);
-      %% cache_timer_serv:start_counter(KeyVersionList, TxId#tx_id{snapshot_time=TsMax}, 10, ?LEASE, self()); %% todo add start_counter to link them to the same component. since there version is not -1 that mans they have been cached beforehand
-                                   %% thus having no need for a timmer
+
 
 
     [_H|_T] ->
@@ -279,7 +279,6 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
         end, KTList)                                                           %% every {Key, Type} inside a version 
       end,[], Tail),     
                                                                                  %% every specific version
-      
       case lists:any( fun(E) -> E=:=-1 end, Versions) of 
         true -> 
            cache_timer_serv:start_counter(lists:map(
@@ -372,7 +371,7 @@ handle_cast(Msg, State) ->
 %%{[{Partition,Node}, [{Key, Type, {Operation, Actor}}]], TxId}
 %% WriteSet = 
 handle_info({lease_expired, Keys}, State=#state{table_name = Table, keys_with_hit_count = Prepared, old_versions = OldVersoins}) ->
-  io:format("lease expired on keys: ~p~p~n ",[Keys, pl]),
+  io:format("lease expired on keys: ~p~n ",[Keys]),
 
   %% get all entries from ets by key from expired set and create one transaction.  
   FlatmapOps = fun({Key, Version}, Dict) ->
@@ -481,7 +480,7 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
                           time_created = 0, type = Type, timestamp = TS, ops = []}, 
           %% start counter only if element has was not previously cached.
           %% not a good ideea since it might trigger a counter for a key linked to a previous cachef one by a transaction id
-          %cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
+          % cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
           {ok, Object};
         {error, Reason} -> 
           {error, Reason}
@@ -489,6 +488,7 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
 
       %%object found in cache. update last_accessdd and increse hit_count
       [Object] ->
+        %%todo persist this update in ets as well 
         UpdatedObject = Object#crdt{hit_count = Object#crdt.hit_count+1, last_accessed = time_now()},
         {ok, UpdatedObject}
    end.
@@ -509,7 +509,7 @@ fetch_cachable_crdt({Partition, Node},Key, Type, TxId, Table) ->
 %   end.
 
 
-%%Caled in case of a read or single update. If object has just been cached, its hitcount is -1. This means a counter has never been trigger for this key
+%% Caled in case of a read or single update. If object has just been cached, its hitcount is -1. This means a counter has never been trigger for this key
 %% When an object is cached, its hit_count is 0. In this situation, a trigger is created for this one object. When the timer expires, an event is 
 %% generated and the updated object is sent back to its owner. 
 %% If a multi-key transaction involves an already cached object,for which a trigger has already been activated, (and, without loosing generality, we can 
