@@ -18,7 +18,6 @@
 
 -export([start_counter/5]).
 
--define(IF(Cond,Then,Else), (case (Cond) of true -> (Then); false -> (Else) end)).
 
 %% Graph keeps track of relations between keys of multi-key transactions
 %% Table is a key-value store where key denotes a crdt and the value is its timer reference
@@ -62,10 +61,14 @@ handle_call({start_counter, _TxId, Keys, Lease, HitCount, Sender}, _From, State=
   Reply = case HitCount > 0 of
     false ->
       [Key| _ ] = Keys, 
+
       {ok, TRef} = timer:send_after(Lease, self(), {send_lease_expired, {Key, Sender}}),
       io:format("activating trigger for ~p ~n ",[[Key, {tref, TRef}]]),
-      %%link a TRef to these keys 
-      insert_dependencies([Key, {tref, TRef}], Graph);
+      
+      %%todo if timer expires before inser_dependencies finishes .... put a boundary on lease???
+      ?IF(Lease > 0,
+        insert_dependencies([Key, {tref, TRef}], Graph),    %% if lease is not 0 link a TRef to these keys 
+        {ok, quick_evict});                                 %% if lease is 0 there is no need to add Tref to graph. 
     true ->
       ok
     end,
@@ -73,7 +76,7 @@ handle_call({start_counter, _TxId, Keys, Lease, HitCount, Sender}, _From, State=
 
 handle_call({cancel_timer, TRef}, _From, State) ->
   Reply = timer:cancel(TRef),
-  {reply, Reply, State}.
+  {noreply, Reply, State}.
 
 %% ================================================================
 
@@ -83,11 +86,9 @@ handle_info({send_lease_expired, {Key, Sender}},  State=#state{graph = Graph}) -
   ListOfKeys = lists:foldl(
     fun(Val,A1) -> 
       case Val of 
-        {{tref, TRef}} -> 
-          timer:cancel(TRef),
+        {{tref, TRef}} -> timer:cancel(TRef),
           A1; 
-        {V} -> 
-          [V|A1] 
+        {V} -> [V|A1] 
       end 
     end, [], ListOfVertices),
   
@@ -109,6 +110,7 @@ handle_cast(_Msg, State) ->
 
 %% ================================================================
 
+%% todo add lock on graph to insure no keys are inserted during eviction => bad clash inconsistent state
 insert_dependencies(Keys, Graph) ->
   io:format("inserting dependendcies among keys: ~p, ~n",[Keys]),
   InsertDependency = fun (CurrentKey, PrevKey) ->
