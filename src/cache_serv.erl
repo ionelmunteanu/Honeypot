@@ -186,6 +186,7 @@ handle_call(evict, _From, State=#state{table_name = Table}) ->
 handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = Table}) ->
   %% todo put lock in case of lease expiration during TX
   %% timestamp of -1 symbolies cache miss. 
+  %% todo remove 
   OrderedByTS = lists:foldl(fun({K, Type}, OrdDict) ->
                               case ets:lookup(Table, K) of
                                 [] -> 
@@ -208,18 +209,23 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
   Reply = case Versions of
     [-1] -> 
       io:format("version is -1~n"),
-      {ObjectList, TsMax} = lists:foldl(fun({Key, Type}, {AccL, AccTs}) -> 
+      {ObjectList, TsMax, Errors} = lists:foldl(fun({Key, Type}, {AccL, AccTs, ErrAcc}) -> 
                                           case  fetch_cachable_crdt(Key, Type,TxId, Table) of
                                             {ok, Object} -> 
-                                              {AccL ++ [Object], ?IF(AccTs > Object#crdt.timestamp, AccTs, Object#crdt.timestamp)}; 
+                                              {AccL ++ [Object], ?IF(AccTs > Object#crdt.timestamp, AccTs, Object#crdt.timestamp), ErrAcc}; 
                                             {error, Reason} -> 
                                               io:format("could not retrieve crdt due to : ~p~n ",[Reason]),
-                                              {AccL, AccTs}
+                                              {AccL, AccTs, ErrAcc ++ [Reason]}
                                           end                                          
-                                        end,{[], -1}, KeyTypeList),
-      lists:map(fun(Obj) -> ets:insert(Table, Obj#crdt{timestamp = TsMax, hit_count = 1}) end, ObjectList),
-      trigger_counter(ObjectList, TxId),
-      ObjectList;
+                                        end,{[], -1, []}, KeyTypeList),
+    
+      case Errors of
+        [] ->
+          lists:map(fun(Obj) -> ets:insert(Table, Obj#crdt{timestamp = TsMax, hit_count = 1}) end, ObjectList),
+          trigger_counter(ObjectList, TxId),
+         lists:map(fun(Obj) -> Type = Obj#crdt.type, {Obj#crdt.key, Type:value(Obj#crdt.snapshot)} end,ObjectList);
+        _ -> Errors
+      end;
     
     %%todo add prunning
     [Version] when Version > -1 ->
@@ -227,7 +233,8 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
       %% all keys already stored udner the same version already
       lists:map( fun({Key, Type}) -> 
                   {ok,Object} = fetch_cachable_crdt(Key, Type,TxId, Table),
-                  Object
+                  Type = Object#crdt.type, 
+                  {Object#crdt.key, Type:value(Object#crdt.snapshot)}
                 end, KeyTypeList);
     
     [_H|_T] ->
@@ -236,20 +243,38 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
       io:format("version do not match. ~n"),
       [{TsMax, _} | Tail ] = lists:reverse(orddict:to_list(OrderedByTS)),       % order decresengly by key version
                                                                                 % list of updates objects  
-      KeysToEvict = lists:map(fun({K, _}) -> K end, Tail),
+
+      io:format("Tail is: ~p~n",[Tail]),                                                                        
+      %%KeysToEvict = lists:map(fun({K, _}) -> K end, lists:filter(fun(E) -> E /= -1 end, Tail)),
+      KeysToEvict = lists:foldl(fun({Version, KeyList},Acc) -> ?IF(Version /= -1, KeyList++Acc, Acc) end, [], Tail),
+      io:format("keys to evict: ~p~n",[KeysToEvict] ),  
       quick_evict(KeysToEvict, TxId),   % quick evict 
 
       ObjectList = lists:map(fun({Key, Type}) -> 
-                                {ok,Object} = fetch_cachable_crdt(Key, Type,TxId, Table),
-                                ets:insert(Table, Object#crdt{timestamp = TsMax, hit_count = Object#crdt.hit_count + 1}),
-                                Object
+                                case fetch_cachable_crdt(Key, Type,TxId, Table) of 
+                                  {ok,Object} ->
+                                    ets:insert(Table, Object#crdt{timestamp = TsMax, hit_count = Object#crdt.hit_count + 1}),
+                                    Object;
+                                  {error, Reason} ->
+                                    {error, Reason}
+                                  end
                               end, KeyTypeList),
-      trigger_counter(ObjectList,TxId),
-      ObjectList      
+      {Errors, _} = lists:partition(
+        fun(A) -> 
+          case A of 
+            {error, _ } -> true; 
+            _ -> false 
+          end
+        end , ObjectList),
+      
+      case Errors of
+        [] ->
+          trigger_counter(ObjectList,TxId),
+          lists:map(fun(Obj) -> Type = Obj#crdt.type, {Obj#crdt.key, Type:value(Obj#crdt.snapshot)} end,ObjectList);
+        _ -> Errors
+      end
     end,
-
-  Repl1 = lists:map(fun(Obj) -> Type = Obj#crdt.type, {Obj#crdt.key, Type:value(Obj#crdt.snapshot)} end, Reply),
-  {reply, Repl1, State};
+  {reply, Reply, State};
 
 
 
@@ -471,7 +496,10 @@ fetch_cachable_crdt(Key, Type, TxId, Table) ->
 %%    
 
 quick_evict(KeyList, TxId) -> 
-  cache_timer_serv:start_counter(KeyList, TxId, 0, 0, self()). 
+  case KeyList of 
+    [] -> ok;
+    _ -> cache_timer_serv:start_counter(KeyList, TxId, 0, 0, self())
+  end.
 
 
 trigger_counter(CrdtList, TxId) ->
@@ -479,12 +507,16 @@ trigger_counter(CrdtList, TxId) ->
 
 
 trigger_counter(CrdtList, TxId, Duration) ->
-  {AllKeys, TotalHitCount} = lists:foldl( 
-    fun(Crdt, {Keys,Hits}) ->
-      {[Crdt#crdt.key] ++ Keys , Hits+Crdt#crdt.hit_count}
-    end, {[], 0}, CrdtList),
-  io:format("trigger_counter: ~p ~n", [{AllKeys, TxId, TotalHitCount}]),
-  cache_timer_serv:start_counter(AllKeys, TxId, TotalHitCount, Duration, self()). 
+  case CrdtList of 
+    [] -> ok;
+    _ ->
+      {AllKeys, TotalHitCount} = lists:foldl( 
+        fun(Crdt, {Keys,Hits}) ->
+          {[Crdt#crdt.key] ++ Keys , Hits+Crdt#crdt.hit_count}
+        end, {[], 0}, CrdtList),
+      io:format("trigger_counter: ~p ~n", [{AllKeys, TxId, TotalHitCount}]),
+      cache_timer_serv:start_counter(AllKeys, TxId, TotalHitCount, Duration, self()) 
+  end. 
 
 
 
