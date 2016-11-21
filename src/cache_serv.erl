@@ -4,11 +4,10 @@
 
 -define(CACHE, crdt_cache).
 -define(BKUP_FILE, "cache_restore_file").
--define(MAX_TABLE_SIZE, 200).
+-define(MAX_TABLE_SIZE, 2000).
 -define(MAX_INT, 65535).
 
 -define(MAX_RETRIES, 5).
-
 
 
 %%  Eviction strategy based on: 
@@ -174,8 +173,8 @@ handle_call({read, {{_Partition, _Node}, Key, Type, TxId}}, _From, State=#state{
   {reply, Reply, State};
 
 
-handle_call(evict, _From, State=#state{table_name = Table}) ->
-  evict(Table),
+handle_call(evict, _From, State=#state{table_name = Table, keys_with_hit_count = Prepared}) ->
+  evict(Table, Prepared),
   {noreply, State};
 
 
@@ -248,7 +247,7 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
       %%KeysToEvict = lists:map(fun({K, _}) -> K end, lists:filter(fun(E) -> E /= -1 end, Tail)),
       KeysToEvict = lists:foldl(fun({Version, KeyList},Acc) -> ?IF(Version /= -1, KeyList++Acc, Acc) end, [], Tail),
       io:format("keys to evict: ~p~n",[KeysToEvict] ),  
-      quick_evict(KeysToEvict, TxId),   % quick evict 
+      quick_evict(KeysToEvict),   % quick evict 
 
       ObjectList = lists:map(fun({Key, Type}) -> 
                                 case fetch_cachable_crdt(Key, Type,TxId, Table) of 
@@ -286,7 +285,8 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
 %% WriteSet = [{Key, Type, {Operation, Actor}}]
 %% TO DO : case of abort! 
 %%handle_call({update, [{{Partition, Node}, WriteSet}], TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, prepared = Prepared}) ->
-handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit}) ->
+handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#state{table_name = Table, max_table_size = _SizeLimit, 
+  keys_with_hit_count = Prepared}) ->
   
   UpdateVal = fun(FObject, FType, FOp, FActor) ->  
       {ok, Result} = FType:update(FOp, FActor, FObject#crdt.snapshot),
@@ -308,10 +308,10 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
 
       UpdatedObject = Object#crdt {
         snapshot = UpdateVal(Object, Type, Op, Actor), 
-        ops = (Object#crdt.ops ++ [{Op, Actor, TxId}])
+        ops = (Object#crdt.ops ++ [{Op, Actor}])
       },
       
-      make_room(Table, ?MAX_TABLE_SIZE, UpdatedObject),
+      make_room(Table, Prepared, ?MAX_TABLE_SIZE, UpdatedObject),
       
       ets:insert(Table, UpdatedObject), {
         ?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]),                                 %% accumulate keys
@@ -334,7 +334,7 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
       TxId1 = TxId#tx_id{snapshot_time = MaxTs},
       io:format("newly inserted:~p, with total hitcount: ~p  and new txid:~p~n ", [NotEmpty, TotalHitCount, TxId1]),
       %trigger_counter(NotEmpty,TxId, TotalHitCount)   
-      cache_timer_serv:start_counter(lists:map(fun(K ) -> {K, MaxTs} end, NotEmpty), TxId1, TotalHitCount, ?LEASE, self()),
+      cache_timer_serv:start_counter(NotEmpty, TotalHitCount, ?LEASE, self()),
       ok
     end,
 
@@ -355,38 +355,7 @@ handle_cast(Msg, State) ->
 %% WriteSet = 
 handle_info({lease_expired, Keys}, State=#state{table_name = Table, keys_with_hit_count = Prepared}) ->
   io:format("lease expired on keys: ~p~n ",[Keys]),
-
-  %% get all entries from ets by key from expired set and create one transaction.  
-  FlatmapOps = fun(Key, Dict) ->
-    case ets:lookup(Table, Key) of
-      [] ->
-        io:format("key: ~p not found~n", [Key]), 
-        Dict;
-      [Result] ->
-        Bla = case length(Result#crdt.ops) > 0 of 
-          true ->
-              Answ =[ {Op, Actor} || {Op, Actor, _Tx} <- Result#crdt.ops],
-              dict:store(get_location(Key), [{Result#crdt.key, Result#crdt.type, Answ}], Dict);
-          false -> 
-            io:format("no op found, returning nothing~n"),
-            Dict
-        end,
-        ets:delete_object(Table, Result),
-        Bla
-    end
-  end,
-
-
-  Fm = lists:foldl(FlatmapOps, dict:new(), Keys), 
-  case dict:size(Fm) > 0  of
-    true ->
-      Tx = tx_utilities:create_transaction_record(ignore),     
-      ets:insert(Prepared, {Tx, Fm, ?MAX_RETRIES}),
-      %%TODO replace whit a pool of workers
-      cache_2pc_sup:start_worker( Tx, Fm, self());
-    false ->
-      ok
-    end,
+  key_handover(Keys, Table, Prepared),
   {noreply, State};
 
 
@@ -495,10 +464,10 @@ fetch_cachable_crdt(Key, Type, TxId, Table) ->
 %% @param TotalHitCount - if it is 0 a trigger will be set
 %%    
 
-quick_evict(KeyList, TxId) -> 
+quick_evict(KeyList) -> 
   case KeyList of 
     [] -> ok;
-    _ -> cache_timer_serv:start_counter(KeyList, TxId, 0, 0, self())
+    _ -> cache_timer_serv:start_counter(KeyList, 0, 0, self())
   end.
 
 
@@ -515,11 +484,64 @@ trigger_counter(CrdtList, TxId, Duration) ->
           {[Crdt#crdt.key] ++ Keys , Hits+Crdt#crdt.hit_count}
         end, {[], 0}, CrdtList),
       io:format("trigger_counter: ~p ~n", [{AllKeys, TxId, TotalHitCount}]),
-      cache_timer_serv:start_counter(AllKeys, TxId, TotalHitCount, Duration, self()) 
+      cache_timer_serv:start_counter(AllKeys, TotalHitCount, Duration, self()) 
   end. 
 
 
 
+
+
+key_handover(Keys, Table, Prepared) ->
+
+  %% generic function to compress all cached operations of a CRDT
+  %% test for multiple crdts
+  CompressedOp = fun(Crdt) ->
+    Type = Crdt#crdt.type,  
+    NewPLM = lists:foldl(fun({Op, _},  Acc)-> 
+      io:format("update with operations ~p", [Op]),
+      {ok, Res} = Type:update(Op, c, Acc),  
+      Res
+    end, Type:new(), Crdt#crdt.ops),
+    io:format("compressing key ~p from ~p to => ",[Crdt#crdt.key,Crdt#crdt.ops] ),    
+    Plm = Type:new(compressed, Type:value(NewPLM)),  %% new Crdt instantiated to the value of the operations stored
+    io:format("compressed crdt:~p ~n", [Plm]),
+    Plm
+  end,
+
+  %% get all entries from ets by key from expired set and create one transaction.  
+  FlatmapOps = fun(Key, Dict) ->
+    case ets:lookup(Table, Key) of
+      [] ->
+        io:format("key: ~p not found~n", [Key]), 
+        Dict;
+      [Result] ->
+        Bla = case length(Result#crdt.ops) > 0 of 
+          true -> %%todo putt this in worker and make it async 
+            Answ = ?IF( ?COMPRESS , 
+              CompressedOp(Result), %% op compression on 
+              [ {Op, Actor} || {Op, Actor, _Tx} <- Result#crdt.ops]), %% no op compression 
+              dict:store(get_location(Key), [{Result#crdt.key, Result#crdt.type, Answ}], Dict);
+          false -> 
+            io:format("no op found, returning nothing~n"),
+            Dict
+        end,
+        true = ets:delete_object(Table,  Result),
+        [] = ets:lookup(Table, Key),
+        Bla
+    end
+  end,
+
+  Fm = lists:foldl(FlatmapOps, dict:new(), Keys), 
+  case dict:size(Fm) > 0  of
+    true ->
+      Tx = tx_utilities:create_transaction_record(ignore),     
+      ets:insert(Prepared, {Tx, Fm, ?MAX_RETRIES}),
+      %%TODO replace whit a pool of workers
+      cache_2pc_sup:start_worker( Tx, Fm, self());
+    false ->
+      ok
+    end.
+%% key_handover
 
 
 
@@ -527,7 +549,7 @@ trigger_counter(CrdtList, TxId, Duration) ->
 
 % %% Evicts cache CRDTs using defined strategy until ExtraSizeAmount 
 % %% space is cleared from the cache
-make_room(Table, SizeLimit, Object) ->
+make_room(Table, Prepared, SizeLimit, Object) ->
   ExtraSizeAmount = case ets:lookup(Table, Object#crdt.key) of
     [] ->
       %%need to store the entire object
@@ -536,22 +558,22 @@ make_room(Table, SizeLimit, Object) ->
       %%need to store only the ops
       size(term_to_binary(Object#crdt.ops))   
   end,
-  io:format("ExtraSizeAmount:~B;SizeLimit: ~B~n",[ExtraSizeAmount,SizeLimit]),
+  io:format("ExtraSizeAmount:~B;SizeLimit: ~B, Table size:~B ~n",[ExtraSizeAmount,SizeLimit, ets:info(Table, memory)]),
   case ((ets:info(Table, memory) + ExtraSizeAmount) < SizeLimit) of
     true ->
       io:format("there is enough space~n") ,
       ok; %% to do make rcusive and return list ??
     false -> 
       io:format ("there is not enough space~n") ,
-      evict(Table),
-      make_room(Table, SizeLimit, Object)
+      evict(Table, Prepared),
+      make_room(Table,Prepared, SizeLimit, Object)
   end.
 
 
 
 
 % % %% TO DO: test this function
-evict(Table) ->
+evict(Table, Prepared) ->
   GetMin = fun (Obj1, Obj2) -> 
     case Obj1#crdt.?EVICT_STRAT_FIELD < Obj2#crdt.?EVICT_STRAT_FIELD of 
       true -> Obj1;
@@ -563,8 +585,11 @@ evict(Table) ->
             last_accessed = time_now(), 
             time_created  = time_now()}, 
             Table ),
-  io:format("evicting ~p ~n",[Object]),
-  cache_timer_serv:start_counter([Object#crdt.key], 0, 0, 0, self()),
+  io:format("evicting ~p ~n",[Object#crdt.key]),
+  ConnectedKeys = cache_timer_serv:evict_sync(Object#crdt.key),
+  key_handover(ConnectedKeys, Table, Prepared), 
+  io:format("evicted keys ~p~n", [ConnectedKeys]),
+  io:format("table memory is now: ~B ~n", [ets:info(Table, memory)]),
   ok.
 
 

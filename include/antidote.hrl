@@ -20,7 +20,8 @@
 
 -define(USE_HONEYPOT, true).
 -define(IF(Cond,Then,Else), (case (Cond) of true -> (Then); false -> (Else) end)).
--define(LEASE, 35000).
+-define(LEASE, 5000).
+-define(COMPRESS, true).
 
 -record (payload, {key:: key(), type :: type(), op_param, actor}).
 

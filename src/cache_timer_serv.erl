@@ -16,7 +16,10 @@
     handle_info/2,
     handle_cast/2 ]).
 
--export([start_counter/5]).
+-export([
+  start_counter/4,
+  evict_sync/1
+  ]).
 
 
 %% Graph keeps track of relations between keys of multi-key transactions
@@ -36,8 +39,11 @@ start_link() ->
 stop() ->
   gen_server:cast(?MODULE, stop).
 
-start_counter(KeyList, TxId, HitCount, Lease, From) ->
-  gen_server:call( gen_timer_serv_name(), {start_counter,TxId, KeyList, Lease, HitCount, From} ).
+start_counter(KeyList,  HitCount, Lease, From) ->
+  gen_server:call( gen_timer_serv_name(), {start_counter, KeyList, Lease, HitCount, From} ).
+
+evict_sync(Key) ->
+  gen_server:call(gen_timer_serv_name(), {evict_now, Key} ).
 
 
 %% ===================================================================
@@ -53,12 +59,17 @@ init([]) ->
 
 %% ================================================================
 
-handle_call({start_counter, _TxId, Keys, Lease, HitCount, Sender}, _From, State=#state{graph = Graph}) ->
+handle_call({evict_now, Key },_From, State=#state{graph = Graph}) ->
+  {reply, pop_reaching_nodes(Key, Graph) , State};
+
+
+
+handle_call({start_counter, Keys, Lease, HitCount, Sender}, _From, State=#state{graph = Graph}) ->
   %%Reply = case  timer:send_after(Lease, Sender, {lease_expired, Keys, [time_now()]}) of
   io:format("list sent to these fuckers:~p~n ", [Keys]),
   insert_dependencies(Keys, Graph),
   io:format("connected components: ~p, ~n ", [digraph_utils:strong_components(Graph)]), 
-  Reply = case HitCount > 0 of
+  Reply = case HitCount =< 0 of
     false ->
       [Key| _ ] = Keys, 
 
@@ -81,24 +92,11 @@ handle_call({cancel_timer, TRef}, _From, State) ->
 %% ================================================================
 
 handle_info({send_lease_expired, {Key, Sender}},  State=#state{graph = Graph}) ->
-  ListOfVertices = digraph_utils:reaching([{Key}], Graph),
-
-  ListOfKeys = lists:foldl(
-    fun(Val,A1) -> 
-      case Val of 
-        {{tref, TRef}} -> timer:cancel(TRef),
-          A1; 
-        {V} -> [V|A1] 
-      end 
-    end, [], ListOfVertices),
-  
-  digraph:del_vertices(Graph, ListOfVertices),
   %% [JustKey || {JustKey} <- ListOfVertices],
-  io:format("list of expired keys: ~p~n", [ListOfKeys] ),
-  io:format("remaining vertices: ~p~n",[digraph:vertices(Graph)]),
-  Sender ! {lease_expired, ListOfKeys},
-
+  Cacat = pop_reaching_nodes(Key, Graph),
+  Sender ! {lease_expired, Cacat },
   {noreply, State};
+
 
 handle_info(_Msg, State) ->
   {noreply, State}.
@@ -127,6 +125,26 @@ insert_dependencies(Keys, Graph) ->
   end,
   lists:foldl(InsertDependency,[], Keys),
   ok.
+
+%% remove all nodes reaching Key and return them as list. 
+pop_reaching_nodes(Key, Graph) ->
+  ListOfVertices = digraph_utils:reaching([{Key}], Graph),
+  io:format("removing all keys linked to <<~p>> from graph:~p ~n", [Key,ListOfVertices]),
+  digraph:del_vertices(Graph, ListOfVertices),
+  
+  
+  io:format("remaining vertices: ~p~n",[digraph:vertices(Graph)]),
+  
+  Pla = lists:foldl(
+    fun(Val,A1) -> 
+      case Val of 
+        {{tref, TRef}} -> timer:cancel(TRef),
+          A1; 
+        {V} -> [V|A1] 
+      end 
+    end, [], ListOfVertices),
+  io:format("all the keys that will be  evicted: ~p~n", [Pla] ),
+  Pla.
 
 
 %% ================================================================

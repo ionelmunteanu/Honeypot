@@ -584,7 +584,7 @@ update_store([], _TxId, _TxCommitTime, _InMemoryStore) ->
 %update_store([{Key, Type, {Param, Actor}}|Rest], TxId, TxCommitTime, InMemoryStore, RampStore) ->
 update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
     %lager:info("Store ~w",[InMemoryStore]),
-
+    io:format("VNODE RECEIVED: k-~p, type-~p and ops-~p~n",[Key, Type, {i,Ops,i}]),
     case ets:lookup(InMemoryStore, Key) of
         [] ->
      %       lager:info("Wrote ~w to key ~w",[Value, Key]),
@@ -598,7 +598,10 @@ update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
                         {ok, New} = Type:update(Param, Actor, Cr), 
                         New 
                     end, Init, Ops),
-                    {ok, Answ}
+                    {ok, Answ};
+                CRDT ->
+                    io:format("received a compressed crdt: ~p~n", CRDT),
+                    Type:merge(Init, CRDT)
             end, %%case 
             true = ets:insert(InMemoryStore, {Key, [{TxCommitTime, NewSnapshot}]});
         [{Key, ValueList}] ->
@@ -606,6 +609,9 @@ update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
             {RemainList, _} = lists:split(min(20,length(ValueList)), ValueList),
             [{_CommitTime, First}|_] = RemainList,        
             {ok, NewSnapshot} = case Ops of
+                [{compressed, Value}] ->
+                    io:format("received a compressed crdt: ~p~n", Obj),
+                    Type:merge(First, CRDT);
                 {Param, Actor} ->
                     Type:update(Param, Actor, First); 
                     %lager:info("Updateing store for key ~w, value ~w firstly", [Key, Type:value(NewSnapshot)]),  
@@ -614,7 +620,7 @@ update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
                         {ok, New} = Type:update(Param, Actor, Cr), 
                         New 
                     end, First, Ops),
-                    {ok, Answ}
+                    {ok, Answ}                
             end,
             %lager:info("Updateing store for key ~w, value ~w", [Key, Type:value(NewSnapshot)]),
             true = ets:insert(InMemoryStore, {Key, [{TxCommitTime, NewSnapshot}|RemainList]})            
