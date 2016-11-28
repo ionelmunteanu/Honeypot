@@ -69,7 +69,7 @@ handle_call({start_counter, Keys, Lease, HitCount, Sender}, _From, State=#state{
   io:format("list sent to these fuckers:~p~n ", [Keys]),
   insert_dependencies(Keys, Graph),
   io:format("connected components: ~p, ~n ", [digraph_utils:strong_components(Graph)]), 
-  Reply = case HitCount =< 0 of
+  Reply = case HitCount > 0 of
     false ->
       [Key| _ ] = Keys, 
 
@@ -162,4 +162,3 @@ code_change(_OldVsn, State, _Extra) ->
 %% ================================================================
 gen_timer_serv_name() ->
   cache_timer_serv.
-

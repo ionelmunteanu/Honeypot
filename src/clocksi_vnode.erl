@@ -598,10 +598,7 @@ update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
                         {ok, New} = Type:update(Param, Actor, Cr), 
                         New 
                     end, Init, Ops),
-                    {ok, Answ};
-                CRDT ->
-                    io:format("received a compressed crdt: ~p~n", CRDT),
-                    Type:merge(Init, CRDT)
+                    {ok, Answ}
             end, %%case 
             true = ets:insert(InMemoryStore, {Key, [{TxCommitTime, NewSnapshot}]});
         [{Key, ValueList}] ->
@@ -609,10 +606,7 @@ update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
             {RemainList, _} = lists:split(min(20,length(ValueList)), ValueList),
             [{_CommitTime, First}|_] = RemainList,        
             {ok, NewSnapshot} = case Ops of
-                [{compressed, Value}] ->
-                    io:format("received a compressed crdt: ~p~n", Obj),
-                    Type:merge(First, CRDT);
-                {Param, Actor} ->
+               {Param, Actor} ->
                     Type:update(Param, Actor, First); 
                     %lager:info("Updateing store for key ~w, value ~w firstly", [Key, Type:value(NewSnapshot)]),  
                 [_H | _T]  ->

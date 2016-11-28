@@ -313,11 +313,12 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
       
       make_room(Table, Prepared, ?MAX_TABLE_SIZE, UpdatedObject),
       
-      ets:insert(Table, UpdatedObject), {
-        ?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]),                                 %% accumulate keys
-        TotalHitCount + Object#crdt.hit_count,                                          %% accumulate total hit_count
-        ?IF(UpdatedObject#crdt.timestamp > MaxTx, UpdatedObject#crdt.timestamp, MaxTx)  %% accumulate max timestamp
-      }
+      ets:insert(Table, UpdatedObject), 
+
+      %% returns 
+      { ?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]),                                     %% accumulate keys
+        ?IF(lists:member(Key, Acc), TotalHitCount, TotalHitCount + Object#crdt.hit_count),  %% accumulate total hit_count for distinct keys 
+        ?IF(UpdatedObject#crdt.timestamp > MaxTx, UpdatedObject#crdt.timestamp, MaxTx)}     %% accumulate max timestamp
   end, %UpdateItemFun
 
   UpdateWriteset = fun({_,WSs}, {Ks, Hc, Mt}) ->
@@ -492,22 +493,6 @@ trigger_counter(CrdtList, TxId, Duration) ->
 
 
 key_handover(Keys, Table, Prepared) ->
-
-  %% generic function to compress all cached operations of a CRDT
-  %% test for multiple crdts
-  CompressedOp = fun(Crdt) ->
-    Type = Crdt#crdt.type,  
-    NewPLM = lists:foldl(fun({Op, _},  Acc)-> 
-      io:format("update with operations ~p", [Op]),
-      {ok, Res} = Type:update(Op, c, Acc),  
-      Res
-    end, Type:new(), Crdt#crdt.ops),
-    io:format("compressing key ~p from ~p to => ",[Crdt#crdt.key,Crdt#crdt.ops] ),    
-    Plm = Type:new(compressed, Type:value(NewPLM)),  %% new Crdt instantiated to the value of the operations stored
-    io:format("compressed crdt:~p ~n", [Plm]),
-    Plm
-  end,
-
   %% get all entries from ets by key from expired set and create one transaction.  
   FlatmapOps = fun(Key, Dict) ->
     case ets:lookup(Table, Key) of
@@ -518,7 +503,7 @@ key_handover(Keys, Table, Prepared) ->
         Bla = case length(Result#crdt.ops) > 0 of 
           true -> %%todo putt this in worker and make it async 
             Answ = ?IF( ?COMPRESS , 
-              CompressedOp(Result), %% op compression on 
+              compress_crdt(Result), %% op compression on 
               [ {Op, Actor} || {Op, Actor, _Tx} <- Result#crdt.ops]), %% no op compression 
               dict:store(get_location(Key), [{Result#crdt.key, Result#crdt.type, Answ}], Dict);
           false -> 
@@ -612,3 +597,28 @@ gen_timer_serv_name() ->
 
 gen_table_name() ->
   cache_timer .
+
+%% adapter/visitor to handle un-uniform crdt implementation and reduce the operation count 
+%% to the equivalent minimum (i.e. {inc, 1}, {inc, 2},..{inc, 100} to {inc, 5050})
+
+compress_crdt(Crdt) ->
+  Tp = Crdt#crdt.type, 
+   io:format("compressing key ~p from ~p to => ",[Crdt#crdt.key,Crdt#crdt.ops] ),
+  Pl = case Tp of
+    riak_dt_gcounter->
+    [{{increment, lists:foldl( fun({Op, _Acc}, Sum) -> 
+      Sum + case Op of 
+        {increment, Am} -> Am;
+        increment -> 1 
+      end 
+    end, 0, Crdt#crdt.ops)}, compressed}];
+    riak_dt_gset   -> {error, "not implemented"};
+    riak_dt_lwwreg -> {error, "not implemented"}; %% lrr wins is the same thing 
+    riak_dt_map    -> {error, "not implemented"};
+    riak_dt_orset  -> {error, "not implemented"};
+    riak_dt_orswot -> {error, "not implemented"};
+    riak_dt_emcntr -> {error, "not implemented"};
+    riak_dt_vclock -> {error, "not implemented"}
+  end,
+  io:format("compressed crdt:~p ~n", [Pl]),
+  Pl.
