@@ -158,7 +158,9 @@ execute_batch_ops(timeout,
                                     true ->
                                         dict:append(IndexNode, {Key, Type, Op}, UpdatedParts)
                                 end,
-                {UpdatedParts1, RSet}
+                {UpdatedParts1, RSet};
+            _ ->
+                io:format("error while parsing operation: ~p~n",[{Operation}])
         end
     end,
 
@@ -166,7 +168,7 @@ execute_batch_ops(timeout,
     %%ReadSet1 is a list of values [0,1,2,3,]
     {WriteSet1, ReadSet1} = lists:foldl(ProcessOp, {dict:new(), []}, CurrentOps),
     %lager:info("Operations are ~w, WriteSet is ~w, ReadSet is ~w",[CurrentOps, WriteSet1, ReadSet1]),
-    io:format("opeations: ~p ~n", [WriteSet1]),
+    %io:format("opeations: ~p ~n", [WriteSet1]),
     %%cache_serv:read(ReadSet1, TxId), %get keys consistently 
 
 cache_serv:update(dict:to_list(WriteSet1), TxId, self()),
@@ -176,7 +178,7 @@ fetch_data(ReadSet, TxId) ->
     case ReadSet of
         [] -> [empty];
         _ -> FromRs = cache_serv:read(ReadSet, TxId), 
-            io:format("result: ~p~n", [FromRs]),
+            %io:format("result: ~p~n", [FromRs]),
             FromRs
     end.
 
@@ -205,7 +207,7 @@ receive_prepared(timeout, S0) ->
 single_committing({committed, CommitTime}, S0=#state{from=_From}) ->
     reply_to_client(S0#state{prepare_time=CommitTime, commit_time=CommitTime, state=committed});
     
-single_committing(abort, S0=#state{from=_From}) ->
+single_committing(aborlt, S0=#state{from=_From}) ->
     reply_to_client(S0#state{state=aborted}).
 
 %% @doc after receiving all prepare_times, send the commit message to all

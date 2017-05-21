@@ -257,7 +257,7 @@ handle_command({prepare, TxId, WriteSet, OriginalSender}, _Sender,
     %[{committed_tx, CommittedTx}] = ets:lookup(TxMetadata, committed_tx),
     Result = prepare(TxId, WriteSet, CommittedTx, TxMetadata, 
                         PrepareTime, IfCertify),
-    io:format("clocsi vnode: result of prepare ~p~n",[Result]),
+    %io:format("clocsi vnode: result of prepare ~p~n",[Result]),
     case Result of
         {ok, NewPrepare} ->
             case IfReplicate of
@@ -513,7 +513,7 @@ certification_check(_, [], _, _, true) ->
 certification_check(TxId, [H|T], CommittedTx, TxMetadata, true) ->
     SnapshotTime = TxId#tx_id.snapshot_time,
     {Key, _Type, _} = H,
-    io:format("txId:~p, key:~p, commitedTx:~p  and the metadata:~p ~n ", [TxId, Key, dict:to_list(CommittedTx), ets:tab2list(TxMetadata)]),
+    %io:format("txId:~p, key:~p, commitedTx:~p  and the metadata:~p ~n ", [TxId, Key, dict:to_list(CommittedTx), ets:tab2list(TxMetadata)]),
     case dict:find(Key, CommittedTx) of
         {ok, CommitTime} ->
             case CommitTime > SnapshotTime of
@@ -584,7 +584,7 @@ update_store([], _TxId, _TxCommitTime, _InMemoryStore) ->
 %update_store([{Key, Type, {Param, Actor}}|Rest], TxId, TxCommitTime, InMemoryStore, RampStore) ->
 update_store([{Key, Type, Ops}|Rest], TxId, TxCommitTime, InMemoryStore) ->
     %lager:info("Store ~w",[InMemoryStore]),
-    io:format("VNODE RECEIVED: k-~p, type-~p and ops-~p~n",[Key, Type, {i,Ops,i}]),
+    %io:format("VNODE RECEIVED: k-~p, type-~p and ops-~p~n",[Key, Type, {i,Ops,i}]),
     case ets:lookup(InMemoryStore, Key) of
         [] ->
      %       lager:info("Wrote ~w to key ~w",[Value, Key]),

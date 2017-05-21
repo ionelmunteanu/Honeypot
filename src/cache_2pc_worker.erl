@@ -97,12 +97,8 @@ init([TxId, WriteSet, From]) ->
       ?CLOCKSI_VNODE:single_commit(dict:to_list(WriteSet), TxId),  %%writeset should be [{Node, {Key, Type[{Op, Act}...]}}}]
       {ok, single_committing, SD#state{state=committing, num_to_ack=1, tx_id=TxId}};  
     true -> 
-      %%this 
-      io:format("the dict:~p~n", [WriteSet]),
-      L = dict:to_list(WriteSet),
-      io:format("the list:~p,~n", [L]),
-      io:format("and the txid: ~p ~n ", [TxId]),
-      
+
+      _L = dict:to_list(WriteSet), %%TODO this might generate issues since L is not used
       ?CLOCKSI_VNODE:prepare(
         WriteSet, 
         TxId),
@@ -223,6 +219,6 @@ handle_sync_event(Event, _From, _StateName, StateData) ->
 code_change(_OldVsn, StateName, State, _Extra) -> {ok, StateName, State}.
 
 terminate(_Reason, _SN, _SD) ->
-    io:format("worker terminating~n"),
+    %io:format("worker terminating~n"),
     ok.
 

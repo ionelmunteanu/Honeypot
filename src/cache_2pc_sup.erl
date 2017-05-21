@@ -13,7 +13,7 @@ start_link() ->
 	supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 start_worker(TxId, WriteSet, From  )->
-	io:format("starting worker ~n"),
+	%io:format("starting worker ~n"),
 	supervisor:start_child(?MODULE, [TxId, WriteSet, From]).
 
 

@@ -60,21 +60,21 @@ init([]) ->
 %% ================================================================
 
 handle_call({evict_now, Key },_From, State=#state{graph = Graph}) ->
-  {reply, pop_reaching_nodes(Key, Graph) , State};
+  {reply, pop_reaching_vertices(Key, Graph) , State};
 
 
 
 handle_call({start_counter, Keys, Lease, HitCount, Sender}, _From, State=#state{graph = Graph}) ->
   %%Reply = case  timer:send_after(Lease, Sender, {lease_expired, Keys, [time_now()]}) of
-  io:format("list sent to these fuckers:~p~n ", [Keys]),
+  %io:format("list sent to these fuckers:~p~n ", [Keys]),
   insert_dependencies(Keys, Graph),
-  io:format("connected components: ~p, ~n ", [digraph_utils:strong_components(Graph)]), 
+  %io:format("connected components: ~p, ~n ", [digraph_utils:strong_components(Graph)]), 
   Reply = case HitCount > 0 of
     false ->
       [Key| _ ] = Keys, 
 
       {ok, TRef} = timer:send_after(Lease, self(), {send_lease_expired, {Key, Sender}}),
-      io:format("activating trigger for ~p ~n ",[[Key, {tref, TRef}]]),
+      %io:format("activating trigger for ~p ~n ",[[Key, {tref, TRef}]]),
       
       %%todo if timer expires before inser_dependencies finishes .... put a boundary on lease???
       ?IF(Lease > 0,
@@ -93,7 +93,7 @@ handle_call({cancel_timer, TRef}, _From, State) ->
 
 handle_info({send_lease_expired, {Key, Sender}},  State=#state{graph = Graph}) ->
   %% [JustKey || {JustKey} <- ListOfVertices],
-  Cacat = pop_reaching_nodes(Key, Graph),
+  Cacat = pop_reaching_vertices(Key, Graph),
   Sender ! {lease_expired, Cacat },
   {noreply, State};
 
@@ -110,7 +110,7 @@ handle_cast(_Msg, State) ->
 
 %% todo add lock on graph to insure no keys are inserted during eviction => bad clash inconsistent state
 insert_dependencies(Keys, Graph) ->
-  io:format("inserting dependendcies among keys: ~p, ~n",[Keys]),
+  %io:format("inserting dependendcies among keys: ~p, ~n",[Keys]),
   InsertDependency = fun (CurrentKey, PrevKey) ->
     case PrevKey of
       [] ->
@@ -127,13 +127,13 @@ insert_dependencies(Keys, Graph) ->
   ok.
 
 %% remove all nodes reaching Key and return them as list. 
-pop_reaching_nodes(Key, Graph) ->
+pop_reaching_vertices(Key, Graph) ->
   ListOfVertices = digraph_utils:reaching([{Key}], Graph),
-  io:format("removing all keys linked to <<~p>> from graph:~p ~n", [Key,ListOfVertices]),
+  %io:format("removing all keys linked to <<~p>> from graph:~p ~n", [Key,ListOfVertices]),
   digraph:del_vertices(Graph, ListOfVertices),
   
   
-  io:format("remaining vertices: ~p~n",[digraph:vertices(Graph)]),
+  %io:format("remaining vertices: ~p~n",[digraph:vertices(Graph)]),
   
   Pla = lists:foldl(
     fun(Val,A1) -> 
@@ -143,7 +143,7 @@ pop_reaching_nodes(Key, Graph) ->
         {V} -> [V|A1] 
       end 
     end, [], ListOfVertices),
-  io:format("all the keys that will be  evicted: ~p~n", [Pla] ),
+  %io:format("all the keys that will be  evicted: ~p~n", [Pla] ),
   Pla.
 
 
