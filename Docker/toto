@@ -1,0 +1,16 @@
+#! bin/bash
+
+cd /
+
+./antidote/bin/antidote start
+
+if [ "$CLUSTER_MASTER_NAME" = "$HOSTNAME" ] then 
+	wait 20
+	./antidote/bin/antidote-admin cluster plan
+	./antidote/bin/antidote -admin cluster commit
+else
+
+fi	
+
+
+./antidote/bin/antidote attach

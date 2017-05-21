@@ -1,0 +1,76 @@
+version: '2'
+
+networks:
+    antidote_ring:
+     driver: bridge
+    client_network:
+     driver: bridge
+
+services:
+  master:
+    hostname: "master"
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: master
+    stdin_open: true
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname master"
+      CLUSTER_MASTER_NAME: "master"
+
+
+  node2:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    hostname: "node2"
+    image: node2
+    stdin_open: true
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node2"
+      CLUSTER_MASTER_NAME: "master"
+
+
+  node3:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    image: node3
+    hostname: "node3"
+    stdin_open: true 
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node3"
+      CLUSTER_MASTER_NAME: "master"
+
+
+
+  node4:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    image: node4
+    hostname: "node4"
+    stdin_open: true 
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node4"
+      CLUSTER_MASTER_NAME: "master"
+

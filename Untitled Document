@@ -1,0 +1,53 @@
+erlc -o rel/antidote/lib/antidote-1/ebin -I include/ src/cache_serv.erl 
+
+antidote:clocksi_execute_g_tx([[{read, m, riak_dt_gcounter}, {read,m,riak_dt_gcounter}, {read,m,riak_dt_gcounter}]]).
+
+antidote:clocksi_execute_g_tx([[{read, k1, riak_dt_gcounter},{read, key2, riak_dt_gcounter}, {read, key3, riak_dt_gcounter},
+{read,plm,riak_dt_gcounter}]]).
+
+antidote:clocksi_execute_g_tx([[{update, key1, riak_dt_gcounter,{increment, actor1}, {update, key2, riak_dt_gcounter,{increment, actor2}} ] ] ).
+
+antidote:clocksi_execute_g_tx([[{update,x,riak_dt_gcounter,{increment,actor1}}]]), antidote:clocksi_execute_g_tx([[{update, x,
+riak_dt_gcounter,{increment, actor2}}, {update,y,riak_dt_gcounter,{{increment, 100}, actor3}}]]).
+
+
+
+
+antidote:clocksi_execute_g_tx([[{update, plm, riak_dt_gcounter,{increment, act_plm}},
+{update, plm, riak_dt_gcounter,{{increment,11}, act_plm}},
+{update, plm, riak_dt_gcounter,{{increment,12}, act_plm}},
+{update, plm2, riak_dt_gcounter,{{increment, 13}, act_plm}},
+{update, plm2, riak_dt_gcounter,{{increment,14}, act_plm}}]]).
+
+
+antidote:clocksi_execute_g_tx([[{read, plm, riak_dt_gcounter}, {read,plm2,riak_dt_gcounter}, {read,m,riak_dt_gcounter}]]).
+
+
+antidote:clocksi_execute_g_tx([[{read, x, riak_dt_gcounter}, {read,y,riak_dt_gcounter}]]).
+
+antidote:clocksi_execute_g_tx([[{update, 1, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, 2, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, 3, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, 1, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, m, riak_dt_gcounter,{increment, 1}}, {update,c,riak_dt_gcounter,{increment, c}}, {update,a,riak_dt_gcounter,{increment, c}} ]]),
+antidote:clocksi_execute_g_tx([[{update, m, riak_dt_gcounter,{increment, 1}}, {update,f,riak_dt_gcounter,{increment, c}}, {update,g,riak_dt_gcounter,{increment, c}} ]]),
+antidote:clocksi_execute_g_tx([[{update, 11, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, 21, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, 31, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, 11, riak_dt_gcounter,{increment, 1}} ]]),
+antidote:clocksi_execute_g_tx([[{update, m1, riak_dt_gcounter,{increment, 1}}, {update,c1,riak_dt_gcounter,{increment, c}}, {update,a,riak_dt_gcounter,{increment, c}} ]]),
+antidote:clocksi_execute_g_tx([[{update, m1, riak_dt_gcounter,{increment, 1}}, {update,f1,riak_dt_gcounter,{increment, c}}, {update,g,riak_dt_gcounter,{increment, c}} ]]).
+
+Test scenario
+
+
+dev1: 
+read a, b, c
+update a,b,c
+
+
+dev2:
+read a,b,c
+update a,b,c
+
+benchmark_speculation branch and antidote_driver

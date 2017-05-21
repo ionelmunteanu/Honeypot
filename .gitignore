@@ -16,4 +16,6 @@ doc/
 log/
 tags
 rel/vars/*.config
-all.sh*
+Docker/antidote
+Docker/antidote/*
+
