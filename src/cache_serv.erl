@@ -193,64 +193,64 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
 
 
 
-  % KeysByTS = getKeyVersions(KeyTypeList, Table), 
+  KeysByTS = getKeyVersions(KeyTypeList, Table), 
 
-  % Versions = lists:reverse(orddict:fetch_keys(KeysByTS)), %%lists:reverse(orddict:to_list(OrderedByTS))
+  Versions = lists:reverse(orddict:fetch_keys(KeysByTS)), %%lists:reverse(orddict:to_list(OrderedByTS))
 
-  % % Precondition: VersionList is ordered. 
-  % PartitionedVersions = fun(VersionList) ->
-  %   case VersionList of 
-  %     [-1]          -> {[],[-1]};
-  %     [Version]     -> {[Version], []};
-  %     [Head|Tail]   -> {[Head], Tail} %%?IF( (time_now() - Head) < (?EVICT_RATIO * ?LEASE), {Head, Tail}, {[], VersionList})
-  %   end
-  % end,
+  % Precondition: VersionList is ordered. 
+  PartitionedVersions = fun(VersionList) ->
+    case VersionList of 
+      [-1]          -> {[],[-1]};
+      [Version]     -> {[Version], []};
+      [Head|Tail]   -> {[Head], Tail} %%?IF( (time_now() - Head) < (?EVICT_RATIO * ?LEASE), {Head, Tail}, {[], VersionList})
+    end
+  end,
 
-  % {VersionsToKeep, ToEvictOrUncached} = PartitionedVersions(Versions),
+  {VersionsToKeep, ToEvictOrUncached} = PartitionedVersions(Versions),
 
 
-  % %% Evict older (yet cached) versions and assmble new list of key/type tuples to be retrieved. 
-  % KeysToFetch = lists:flatmap( fun(K) -> 
-  %     KT = orddict:fetch(K, KeysByTS),
-  %     ?IF(K =/= -1, quick_evict(lists:map(fun({Key,_}) -> Key end, KT)), nothing), %%todo take only one key from each version? 
-  %     KT
-  % end, ToEvictOrUncached),
+  %% Evict older (yet cached) versions and assmble new list of key/type tuples to be retrieved. 
+  KeysToFetch = lists:flatmap( fun(K) -> 
+      KT = orddict:fetch(K, KeysByTS),
+      ?IF(K =/= -1, quick_evict(lists:map(fun({Key,_}) -> Key end, KT)), nothing), %%todo take only one key from each version? 
+      KT
+  end, ToEvictOrUncached),
 
-  % {ObjectList, Errors} = lists:foldl(
-  %   fun({Key, Type}, {AccL, ErrAcc}) -> 
-  %     case  fetch_cachable_crdt(Key, Type,TxId, Table) of
-  %       {ok, Object}    ->  {AccL ++ [Object], ErrAcc}; 
-  %       {error, Reason} ->  {AccL, ErrAcc ++ [Reason]}
-  %     end                                          
-  %   end,{[], []}, KeysToFetch),
+  {ObjectList, Errors} = lists:foldl(
+    fun({Key, Type}, {AccL, ErrAcc}) -> 
+      case  fetch_cachable_crdt(Key, Type,TxId, Table) of
+        {ok, Object}    ->  {AccL ++ [Object], ErrAcc}; 
+        {error, Reason} ->  {AccL, ErrAcc ++ [Reason]}
+      end                                          
+    end,{[], []}, KeysToFetch),
 
-  % lists:foreach(fun(Obj) -> ets:insert(Table, Obj#crdt{hit_count = Obj#crdt.hit_count + 1}) end, ObjectList),
-  % trigger_counter(ObjectList),
+  lists:foreach(fun(Obj) -> ets:insert(Table, Obj#crdt{hit_count = Obj#crdt.hit_count + 1}) end, ObjectList),
+  trigger_counter(ObjectList),
   
   
 
-  % Reply = case Errors of
-  %   [] -> 
-  %       KeptVals = lists:flatmap( fun(K) -> orddict:fetch(K, KeysByTS) end, VersionsToKeep),
-  %       KeptObjects = lists:map( 
-  %         fun({K1, T1}) ->
-  %           {ok, Obj} = fetch_cachable_crdt(K1, T1, TxId, Table),
-  %           Obj 
-  %       end, KeptVals),
-  %       lists:map(fun(Obj) -> Type = Obj#crdt.type, {Obj#crdt.key, Type:value(Obj#crdt.snapshot)} end, lists:merge(ObjectList, KeptObjects));
-  %    _ -> Errors
-  % end,
+  Reply = case Errors of
+    [] -> 
+        KeptVals = lists:flatmap( fun(K) -> orddict:fetch(K, KeysByTS) end, VersionsToKeep),
+        KeptObjects = lists:map( 
+          fun({K1, T1}) ->
+            {ok, Obj} = fetch_cachable_crdt(K1, T1, TxId, Table),
+            Obj 
+        end, KeptVals),
+        lists:map(fun(Obj) -> Type = Obj#crdt.type, {Obj#crdt.key, Type:value(Obj#crdt.snapshot)} end, lists:merge(ObjectList, KeptObjects));
+     _ -> Errors
+  end,
 
 
 
- Reply = lists:map(
-    fun({Key, Type}) ->
-      case clocksi_vnode:read_data_item(get_location(Key), Key, Type, TxId) of
-        {ok, {_CrdtType, CrdtSnapshot, TS}} -> {Key, Type:value(CrdtSnapshot)};
-        {error, Reason} -> {error, Reason}
-      end
-    end, KeyTypeList
-  ),
+ % Reply = lists:map(
+ %    fun({Key, Type}) ->
+ %      case clocksi_vnode:read_data_item(get_location(Key), Key, Type, TxId) of
+ %        {ok, {_CrdtType, CrdtSnapshot, TS}} -> {Key, Type:value(CrdtSnapshot)};
+ %        {error, Reason} -> {error, Reason}
+ %      end
+ %    end, KeyTypeList
+ %  ),
 
 {reply, Reply , State};
 

@@ -74,3 +74,92 @@ services:
       NODE_NAME_CMD: "sname node4"
       CLUSTER_MASTER_NAME: "master"
 
+
+
+  node5:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    image: node5
+    hostname: "node5"
+    stdin_open: true 
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node5"
+      CLUSTER_MASTER_NAME: "master"
+
+
+  node6:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    image: node6
+    hostname: "node6"
+    stdin_open: true 
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node6"
+      CLUSTER_MASTER_NAME: "master"
+
+
+
+  node7:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    image: node7
+    hostname: "node7"
+    stdin_open: true 
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node7"
+      CLUSTER_MASTER_NAME: "master"
+
+
+
+  node8:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    image: node8
+    hostname: "node8"
+    stdin_open: true 
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node8"
+      CLUSTER_MASTER_NAME: "master"
+
+
+
+  node9:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on: [master]
+    image: node9
+    hostname: "node9"
+    stdin_open: true 
+    tty: true
+    networks:
+      - antidote_ring
+      - client_network
+    environment:
+      NODE_NAME_CMD: "sname node9"
+      CLUSTER_MASTER_NAME: "master"
+
