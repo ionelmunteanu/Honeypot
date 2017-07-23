@@ -4,7 +4,7 @@
 
 -define(CACHE, crdt_cache).
 -define(BKUP_FILE, "cache_restore_file").
--define(MAX_TABLE_SIZE, 50000).  %% words 
+-define(MAX_TABLE_SIZE, 80000).  %% words 
 -define(MAX_INT, 65535).
 
 -define(MAX_RETRIES, 5).
@@ -34,7 +34,7 @@
 -record (crdt,{
         key :: term(),
         timestamp :: term(),
-        aux_timestamp :: term(),
+        label :: term(),
         snapshot :: term()|[term()],
         hit_count :: integer(),
         %last_accessed :: term(),
@@ -192,65 +192,89 @@ handle_call({make_view, {KeyTypeList, TxId}}, _From, State=#state{table_name = T
   %%io:format("KeyTypeList: ~p  TxId: ~p~n",[KeyTypeList,TxId]),
 
 
-
   KeysByTS = getKeyVersions(KeyTypeList, Table), 
 
   Versions = lists:reverse(orddict:fetch_keys(KeysByTS)), %%lists:reverse(orddict:to_list(OrderedByTS))
+
+  io:format("versions: ~p~n", [Versions]),
 
   % Precondition: VersionList is ordered. 
   PartitionedVersions = fun(VersionList) ->
     case VersionList of 
       [-1]          -> {[],[-1]};
       [Version]     -> {[Version], []};
-      [Head|Tail]   -> {[Head], Tail} %%?IF( (time_now() - Head) < (?EVICT_RATIO * ?LEASE), {Head, Tail}, {[], VersionList})
+      [Head|Tail]   -> {[Head], Tail}
     end
   end,
 
-  {VersionsToKeep, ToEvictOrUncached} = PartitionedVersions(Versions),
+
+  {VersionsToKeep, ToUpdateOrUncached} = PartitionedVersions(Versions),
 
 
   %% Evict older (yet cached) versions and assmble new list of key/type tuples to be retrieved. 
-  KeysToFetch = lists:flatmap( fun(K) -> 
-      KT = orddict:fetch(K, KeysByTS),
-      ?IF(K =/= -1, quick_evict(lists:map(fun({Key,_}) -> Key end, KT)), nothing), %%todo take only one key from each version? 
-      KT
-  end, ToEvictOrUncached),
+  KeysToFetch = lists:flatmap( fun(K) -> orddict:fetch(K, KeysByTS) end, ToUpdateOrUncached),
+
+
+  NewTxId = case VersionsToKeep of 
+    []       -> TxId;
+    [Clock]  -> tx_utilities:create_transaction_record(Clock)
+  end,
+
 
   {ObjectList, Errors} = lists:foldl(
     fun({Key, Type}, {AccL, ErrAcc}) -> 
-      case  fetch_cachable_crdt(Key, Type,TxId, Table) of
+      case  fetch_cachable_crdt(Key, Type, NewTxId, Table) of %% TODO change clock  in TxId to match versionsToKeep.head
         {ok, Object}    ->  {AccL ++ [Object], ErrAcc}; 
-        {error, Reason} ->  {AccL, ErrAcc ++ [Reason]}
+        {error, Reason} ->  {AccL, ErrAcc ++ [{error, Reason}]}
       end                                          
-    end,{[], []}, KeysToFetch),
+    end, {[], []}, KeysToFetch),
 
-  lists:foreach(fun(Obj) -> ets:insert(Table, Obj#crdt{hit_count = Obj#crdt.hit_count + 1}) end, ObjectList),
+
+  %% compute label for CRDTs. 
+  NewLabel = case VersionsToKeep of 
+    []          -> CrdtTimeStamps = lists:map(fun(CRDT) -> CRDT#crdt.timestamp end, ObjectList),
+                    lists:foldl(fun(TS, MaxTS) -> ?IF(TS > MaxTS, TS, MaxTS)  end, 0, CrdtTimeStamps);
+    [TimeStamp] -> TimeStamp
+  end,
+  
+
+  %% Gets the right version of a crdt from an owner. If the key was previously cached, apply locally stored updates, if any.
+  lists:foreach(fun(Obj) -> 
+    case ets:lookup(Table, Obj#crdt.key) of 
+      []        -> 
+        ets:insert(Table, Obj#crdt{hit_count = Obj#crdt.hit_count + 1, label = NewLabel});
+      [Result]  -> 
+        UpdatedSnapshot  = lists:foldl( 
+          fun({Op, Actor}, Acc) -> 
+            CrdtType = Result#crdt.type,
+            {ok, Result} = CrdtType:update(Op, Actor, Acc), 
+            Result
+          end, Obj#crdt.snapshot, Result#crdt.ops),
+        UpdateEntry = Result#crdt{hit_count     = Obj#crdt.hit_count + 1, 
+                                      label     = NewLabel, 
+                                      snapshot  = UpdatedSnapshot } ,
+        ets:insert(Table, UpdateEntry)
+    end 
+  end, ObjectList),
+  
+
+  %% If the entire read set wasn't previously cached, create a connected component and add timer. 
+  %% If only a subset wasn't previously cached, just link the uncached keys to a connected component which has a timer. 
   trigger_counter(ObjectList),
   
-  
+
 
   Reply = case Errors of
     [] -> 
         KeptVals = lists:flatmap( fun(K) -> orddict:fetch(K, KeysByTS) end, VersionsToKeep),
         KeptObjects = lists:map( 
           fun({K1, T1}) ->
-            {ok, Obj} = fetch_cachable_crdt(K1, T1, TxId, Table),
+            {ok, Obj} = fetch_cachable_crdt(K1, T1, NewTxId, Table),
             Obj 
         end, KeptVals),
         lists:map(fun(Obj) -> Type = Obj#crdt.type, {Obj#crdt.key, Type:value(Obj#crdt.snapshot)} end, lists:merge(ObjectList, KeptObjects));
      _ -> Errors
   end,
-
-
-
- % Reply = lists:map(
- %    fun({Key, Type}) ->
- %      case clocksi_vnode:read_data_item(get_location(Key), Key, Type, TxId) of
- %        {ok, {_CrdtType, CrdtSnapshot, TS}} -> {Key, Type:value(CrdtSnapshot)};
- %        {error, Reason} -> {error, Reason}
- %      end
- %    end, KeyTypeList
- %  ),
 
 {reply, Reply , State};
 
@@ -283,7 +307,7 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
       Object = case ets:lookup(Table, Key) of 
         %% if the key is not cached yet just store the operations and fetch the version from the owner just in case of a read. 
         [] -> #crdt{ key =  Key, snapshot = Type:new(), hit_count = 0, %last_accessed = 0,
-                            time_created = 0, type = Type, timestamp = 0, aux_timestamp = 0,  ops = []};
+                            time_created = 0, type = Type, timestamp = 0, label = 0,  ops = []};
         [Obj] -> Obj#crdt{hit_count = Obj#crdt.hit_count+1 }%, last_accessed = time_now()}
       end,
 
@@ -299,7 +323,7 @@ handle_call({update, ListOfOperations, TxId, _OriginalSender}, _From, State=#sta
       %% returns 
       { ?IF(lists:member(Key, Acc), Acc, Acc ++ [Key]),                                     %% accumulate keys
         ?IF(lists:member(Key, Acc), TotalHitCount, TotalHitCount + Object#crdt.hit_count),  %% accumulate total hit_count for distinct keys 
-        ?IF(UpdatedObject#crdt.aux_timestamp > MaxTx, UpdatedObject#crdt.aux_timestamp, MaxTx)}     %% accumulate max timestamp
+        ?IF(UpdatedObject#crdt.label > MaxTx, UpdatedObject#crdt.label, MaxTx)}     %% accumulate max timestamp
   end, %UpdateItemFun
 
   UpdateWriteset = fun({_,WSs}, {Ks, Hc, Mt}) ->
@@ -403,7 +427,7 @@ fetch_cachable_crdt(Key, Type, TxId, Table) ->
       case clocksi_vnode:read_data_item(get_location(Key), Key, Type, TxId) of
         {ok, {_CrdtType, CrdtSnapshot, TS}} -> 
           Object = #crdt{ key =  Key, snapshot = CrdtSnapshot, hit_count  =  0  , %last_accessed = 0,
-                          time_created = 0, type = Type, aux_timestamp = TxId#tx_id.snapshot_time, timestamp = TS, ops = []}, 
+                          time_created = 0, type = Type, label = TxId#tx_id.snapshot_time, timestamp = TS, ops = []}, 
           %% start counter only if element has was not previously cached.
           %% not a good ideea since it might trigger a counter for a key linked to a previous cachef one by a transaction id
           % cache_timer_serv:start_counter(Node, TxId, [Key], ?LEASE, -1, self()),
@@ -449,11 +473,11 @@ fetch_cachable_crdt(Key, Type, TxId, Table) ->
 %% @param TotalHitCount - if it is 0 a trigger will be set
 %%    
 
-quick_evict(KeyList) -> 
-  case KeyList of 
-    [] -> ok;
-    _ -> cache_timer_serv:start_counter(KeyList, 0, 0, self())
-  end.
+% quick_evict(KeyList) -> 
+%   case KeyList of 
+%     [] -> ok;
+%     _ -> cache_timer_serv:start_counter(KeyList, 0, 0, self())
+%   end.
 
 
 trigger_counter(CrdtList) ->
@@ -599,9 +623,9 @@ getKeyVersions(Keys, Table) ->
             true  -> orddict:append(-1, {K, Type}, OrdDict)
           end;
         [Result] -> 
-          case orddict:is_key(Result#crdt.aux_timestamp, OrdDict) of 
-            false -> orddict:store(Result#crdt.aux_timestamp, [{K, Type}],OrdDict);
-            true  -> orddict:append(Result#crdt.aux_timestamp, {K, Type}, OrdDict)
+          case orddict:is_key(Result#crdt.label, OrdDict) of 
+            false -> orddict:store(Result#crdt.label, [{K, Type}],OrdDict);
+            true  -> orddict:append(Result#crdt.label, {K, Type}, OrdDict)
           end
       end 
     end, orddict:new(), Keys).
